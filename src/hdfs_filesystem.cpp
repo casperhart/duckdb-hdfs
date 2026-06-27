@@ -36,6 +36,20 @@ void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
 	}
 }
 
+// Build DuckDB's extended metadata from a bridge directory entry. The bridge
+// already returns type/size/mtime for every glob and listing entry, so handing
+// them to DuckDB here lets glob expansion, the external file cache, and the
+// glob()/read_blob/read_text functions avoid a second per-file stat RPC.
+shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const hdfs_dir_entry_t &entry) {
+	auto ext = make_shared_ptr<ExtendedOpenFileInfo>();
+	auto &options = ext->options;
+	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
+	options.emplace("file_size", Value::BIGINT(entry.length));
+	// HDFS modification times are epoch milliseconds.
+	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs((int64_t)entry.mtime)));
+	return ext;
+}
+
 // Reattach an authority to a scheme-less path returned by the bridge.
 string MakeUrl(const string &authority, const string &hdfs_path) {
 	string prefix = authority.empty() ? "hdfs://" : authority;
@@ -419,9 +433,9 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target,
 	}
 }
 
-bool HdfsFileSystem::ListFiles(const string &directory,
-                               const std::function<void(const string &, bool)> &callback,
-                               FileOpener *opener) {
+bool HdfsFileSystem::ListFilesExtended(const string &directory,
+                                       const std::function<void(OpenFileInfo &info)> &callback,
+                                       optional_ptr<FileOpener> opener) {
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
@@ -439,14 +453,16 @@ bool HdfsFileSystem::ListFiles(const string &directory,
 		throw IOException("Failed to list HDFS directory '%s': %s", directory, status.Message());
 	}
 	for (int32_t i = 0; i < count; i++) {
-		// ListFiles reports bare child names, not full paths.
+		// Listing reports bare child names, not full paths.
 		string full = entries[i].path ? string(entries[i].path) : string();
 		string name = full;
 		size_t slash = full.find_last_of('/');
 		if (slash != string::npos) {
 			name = full.substr(slash + 1);
 		}
-		callback(name, entries[i].is_dir);
+		OpenFileInfo info(name);
+		info.extended_info = MakeExtendedInfo(entries[i]);
+		callback(info);
 	}
 	if (entries) {
 		hdfs_bridge_free_dir_entries(entries, count);
@@ -474,7 +490,11 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 	result.reserve(count);
 	for (int32_t i = 0; i < count; i++) {
 		string child = entries[i].path ? string(entries[i].path) : string();
-		result.emplace_back(MakeUrl(authority, child));
+		OpenFileInfo info(MakeUrl(authority, child));
+		// Carry the metadata the glob already returned so DuckDB can classify
+		// files vs directories (and read size/mtime) without re-statting each.
+		info.extended_info = MakeExtendedInfo(entries[i]);
+		result.push_back(std::move(info));
 	}
 	if (entries) {
 		hdfs_bridge_free_dir_entries(entries, count);

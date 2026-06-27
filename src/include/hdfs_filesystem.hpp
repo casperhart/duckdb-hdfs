@@ -62,8 +62,15 @@ public:
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
-	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
-	               FileOpener *opener = nullptr) override;
+	// Extended listing: each entry carries type/size/last-modified in
+	// OpenFileInfo::extended_info, so DuckDB doesn't re-stat per file. The base
+	// FileSystem::ListFiles(name, is_dir) overload routes through this.
+	bool ListFilesExtended(const string &directory,
+	                       const std::function<void(OpenFileInfo &info)> &callback,
+	                       optional_ptr<FileOpener> opener) override;
+	bool SupportsListFilesExtended() const override {
+		return true;
+	}
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	void MoveFile(const string &source, const string &target,
 	              optional_ptr<FileOpener> opener = nullptr) override;
