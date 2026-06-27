@@ -3,10 +3,15 @@
 #include "duckdb/common/file_system.hpp"
 #include "hdfs_bridge.h"
 
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
 namespace duckdb {
+
+// Implementation details defined in hdfs_filesystem.cpp.
+struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
+class HdfsConnection; // A reconnectable, lazily-established client for one authority.
 
 struct HdfsFileHandle : public FileHandle {
 	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, hdfs_reader_t *reader,
@@ -79,13 +84,25 @@ public:
 	}
 
 private:
-	// Look up (or create and cache) a client for the given authority
+	// Look up (or create) the connection for the given authority
 	// (e.g. "hdfs://namenode:8020", or "" for the configured default FS).
-	// Connection config is resolved by hdfs-native from the Hadoop environment.
-	hdfs_client_t *GetClient(const string &authority);
+	// Connections are created once and reused; the returned reference is stable.
+	HdfsConnection &GetConnection(const string &authority);
 
-	std::mutex client_mutex;
-	std::unordered_map<string, hdfs_client_t *> client_cache;
+	// Run `op(client, &status)` against a live client for `authority`. `op`
+	// returns true on success. If the first attempt fails with a connection-
+	// level error (stale client after a NameNode failover, a dropped socket, an
+	// expired ticket), the connection is invalidated and `op` is retried once on
+	// a freshly established client. The final outcome is left in `status` (OK on
+	// success, otherwise the last failure with its category and message). A
+	// failure to (re)connect propagates as an IOException.
+	template <class FN>
+	void Execute(const string &authority, BridgeStatus &status, FN &&op);
+
+	// Guards only insertion/lookup into `connections`; entries are never erased,
+	// so the per-connection lock (inside HdfsConnection) covers (re)connection.
+	std::mutex connections_mutex;
+	std::unordered_map<string, unique_ptr<HdfsConnection>> connections;
 };
 
 } // namespace duckdb

@@ -4,29 +4,11 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 
+#include <memory>
+
 namespace duckdb {
 
 namespace {
-
-// RAII owner for an error string produced by the Rust bridge. Pass `&err` where
-// a `char **out_err` is expected; the message is freed on scope exit.
-struct BridgeError {
-	char *msg = nullptr;
-	BridgeError() = default;
-	BridgeError(const BridgeError &) = delete;
-	BridgeError &operator=(const BridgeError &) = delete;
-	~BridgeError() {
-		if (msg) {
-			hdfs_bridge_free_string(msg);
-		}
-	}
-	char **operator&() {
-		return &msg;
-	}
-	string Get() const {
-		return msg ? string(msg) : string("unknown error");
-	}
-};
 
 // Split a path into its authority ("hdfs://host:port", or "" for the default
 // FS) and the scheme-less HDFS path ("/a/b"). Non-hdfs inputs are treated as a
@@ -68,6 +50,95 @@ string MakeUrl(const string &authority, const string &hdfs_path) {
 
 } // namespace
 
+// RAII owner for an `hdfs_status_t` produced by the Rust bridge. Pass `&status`
+// where a `hdfs_status_t *` is expected; the message is freed on scope exit.
+// Reset() makes it reusable across the retry attempts in Execute().
+struct BridgeStatus {
+	hdfs_status_t status {HDFS_OK, nullptr};
+
+	BridgeStatus() = default;
+	BridgeStatus(const BridgeStatus &) = delete;
+	BridgeStatus &operator=(const BridgeStatus &) = delete;
+	~BridgeStatus() {
+		Reset();
+	}
+
+	void Reset() {
+		if (status.msg) {
+			hdfs_bridge_free_string(status.msg);
+			status.msg = nullptr;
+		}
+		status.code = HDFS_OK;
+	}
+	hdfs_status_t *operator&() {
+		return &status;
+	}
+	int Code() const {
+		return status.code;
+	}
+	bool Ok() const {
+		return status.code == HDFS_OK;
+	}
+	bool IsNotFound() const {
+		return status.code == HDFS_ERR_NOT_FOUND;
+	}
+	bool IsConnection() const {
+		return status.code == HDFS_ERR_CONNECTION;
+	}
+	string Message() const {
+		return status.msg ? string(status.msg) : string("unknown error");
+	}
+};
+
+// A reconnectable client for a single authority. The client is established
+// lazily and shared via shared_ptr: an in-flight operation keeps its client
+// alive even if another thread invalidates the connection concurrently (e.g.
+// after a NameNode failover), so reconnection is free of use-after-free.
+class HdfsConnection {
+public:
+	explicit HdfsConnection(string authority) : authority(std::move(authority)) {
+	}
+
+	// Current client, established on first use. The returned shared_ptr keeps it
+	// alive for the duration of the caller's operation.
+	std::shared_ptr<hdfs_client_t> Get() {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (!client) {
+			client = Connect();
+		}
+		return client;
+	}
+
+	// Drop `stale` if it is still the current client, forcing the next Get() to
+	// reconnect. No-op if another thread already reconnected.
+	void Invalidate(const std::shared_ptr<hdfs_client_t> &stale) {
+		std::lock_guard<std::mutex> lock(mutex);
+		if (client == stale) {
+			client.reset();
+		}
+	}
+
+private:
+	// Establish a new client. Caller holds `mutex`.
+	std::shared_ptr<hdfs_client_t> Connect() {
+		// Pass only the authority; hdfs-native resolves the config dir
+		// (HADOOP_CONF_DIR / HADOOP_HOME) and user (HADOOP_USER_NAME / keytab /
+		// current account) from the Hadoop environment.
+		const char *url = authority.empty() ? nullptr : authority.c_str();
+		BridgeStatus status;
+		auto *raw = hdfs_bridge_connect(url, /*config_dir=*/nullptr, /*user=*/nullptr, &status);
+		if (!raw) {
+			throw IOException("Failed to connect to HDFS (%s): %s",
+			                  authority.empty() ? "default fs" : authority.c_str(), status.Message());
+		}
+		return std::shared_ptr<hdfs_client_t>(raw, [](hdfs_client_t *c) { hdfs_bridge_free_client(c); });
+	}
+
+	const string authority;
+	std::mutex mutex;
+	std::shared_ptr<hdfs_client_t> client;
+};
+
 void HdfsFileHandle::Close() {
 	if (reader) {
 		hdfs_bridge_close_reader(reader);
@@ -78,42 +149,48 @@ void HdfsFileHandle::Close() {
 		// is a no-op even if the flush throws.
 		auto *w = writer;
 		writer = nullptr;
-		BridgeError err;
-		if (hdfs_bridge_close_writer(w, &err) < 0) {
-			throw IOException("Failed to close HDFS file '%s': %s", path, err.Get());
+		BridgeStatus status;
+		if (hdfs_bridge_close_writer(w, &status) < 0) {
+			throw IOException("Failed to close HDFS file '%s': %s", path, status.Message());
 		}
 	}
 }
 
 HdfsFileSystem::HdfsFileSystem() = default;
 
-HdfsFileSystem::~HdfsFileSystem() {
-	std::lock_guard<std::mutex> lock(client_mutex);
-	for (auto &pair : client_cache) {
-		hdfs_bridge_free_client(pair.second);
+// Defined here (not defaulted in the header) because HdfsConnection is an
+// incomplete type there; the unique_ptr deleter needs the full definition.
+HdfsFileSystem::~HdfsFileSystem() = default;
+
+HdfsConnection &HdfsFileSystem::GetConnection(const string &authority) {
+	std::lock_guard<std::mutex> lock(connections_mutex);
+	auto it = connections.find(authority);
+	if (it != connections.end()) {
+		return *it->second;
 	}
+	auto conn = make_uniq<HdfsConnection>(authority);
+	auto &ref = *conn;
+	connections[authority] = std::move(conn);
+	return ref;
 }
 
-hdfs_client_t *HdfsFileSystem::GetClient(const string &authority) {
-	std::lock_guard<std::mutex> lock(client_mutex);
-	auto it = client_cache.find(authority);
-	if (it != client_cache.end()) {
-		return it->second;
+template <class FN>
+void HdfsFileSystem::Execute(const string &authority, BridgeStatus &status, FN &&op) {
+	HdfsConnection &conn = GetConnection(authority);
+	for (int attempt = 0;; attempt++) {
+		status.Reset();
+		std::shared_ptr<hdfs_client_t> client = conn.Get(); // throws on connect failure
+		if (op(client.get(), &status)) {
+			return; // success; status == OK
+		}
+		if (attempt == 0 && status.IsConnection()) {
+			// Stale client (failover / dropped socket / expired ticket): drop it
+			// and retry once on a freshly established client.
+			conn.Invalidate(client);
+			continue;
+		}
+		return; // non-retryable failure; details left in status
 	}
-
-	// Pass only the authority; hdfs-native resolves the config dir
-	// (HADOOP_CONF_DIR / HADOOP_HOME) and user (HADOOP_USER_NAME / keytab /
-	// current account) from the Hadoop environment.
-	const char *url_cstr = authority.empty() ? nullptr : authority.c_str();
-
-	BridgeError err;
-	auto *client = hdfs_bridge_connect(url_cstr, /*config_dir=*/nullptr, /*user=*/nullptr, &err);
-	if (!client) {
-		throw IOException("Failed to connect to HDFS (%s): %s",
-		                  authority.empty() ? "default fs" : authority.c_str(), err.Get());
-	}
-	client_cache[authority] = client;
-	return client;
 }
 
 unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlags flags,
@@ -121,25 +198,34 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlag
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(path, authority, hdfs_path);
-	auto *client = GetClient(authority);
 
 	if (flags.OpenForWriting()) {
 		bool overwrite = flags.OverwriteExistingFile();
-		BridgeError err;
-		auto *writer = hdfs_bridge_create(client, hdfs_path.c_str(), overwrite, &err);
+		hdfs_writer_t *writer = nullptr;
+		BridgeStatus status;
+		Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+			writer = hdfs_bridge_create(client, hdfs_path.c_str(), overwrite, st);
+			return writer != nullptr;
+		});
 		if (!writer) {
-			throw IOException("Failed to open HDFS file for writing '%s': %s", path, err.Get());
+			throw IOException("Failed to open HDFS file for writing '%s': %s", path, status.Message());
 		}
 		return make_uniq<HdfsFileHandle>(*this, path, flags, nullptr, writer);
 	}
 
-	BridgeError err;
-	auto *reader = hdfs_bridge_open(client, hdfs_path.c_str(), &err);
+	hdfs_reader_t *reader = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		reader = hdfs_bridge_open(client, hdfs_path.c_str(), st);
+		return reader != nullptr;
+	});
 	if (!reader) {
-		if (flags.ReturnNullIfNotExists()) {
+		// Only a genuine "not found" is reported as a missing file; connection
+		// or permission failures still surface as errors.
+		if (status.IsNotFound() && flags.ReturnNullIfNotExists()) {
 			return nullptr;
 		}
-		throw IOException("Failed to open HDFS file for reading '%s': %s", path, err.Get());
+		throw IOException("Failed to open HDFS file for reading '%s': %s", path, status.Message());
 	}
 	auto handle = make_uniq<HdfsFileHandle>(*this, path, flags, reader, nullptr);
 	int64_t size = hdfs_bridge_file_size(reader);
@@ -159,10 +245,10 @@ void HdfsFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 		throw IOException("Cannot read %lld bytes at offset %llu from HDFS file '%s' of size %llu",
 		                  nr_bytes, location, handle.path, h.length);
 	}
-	BridgeError err;
-	int64_t res = hdfs_bridge_read_range(h.reader, (uint8_t *)buffer, nr_bytes, location, &err);
+	BridgeStatus status;
+	int64_t res = hdfs_bridge_read_range(h.reader, (uint8_t *)buffer, nr_bytes, location, &status);
 	if (res < 0) {
-		throw IOException("Failed to read from HDFS file '%s': %s", handle.path, err.Get());
+		throw IOException("Failed to read from HDFS file '%s': %s", handle.path, status.Message());
 	}
 }
 
@@ -192,10 +278,10 @@ int64_t HdfsFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes
 	if (!h.writer) {
 		throw IOException("File not opened for writing: " + handle.path);
 	}
-	BridgeError err;
-	int64_t res = hdfs_bridge_write(h.writer, (const uint8_t *)buffer, nr_bytes, &err);
+	BridgeStatus status;
+	int64_t res = hdfs_bridge_write(h.writer, (const uint8_t *)buffer, nr_bytes, &status);
 	if (res < 0) {
-		throw IOException("Failed to write to HDFS file '%s': %s", handle.path, err.Get());
+		throw IOException("Failed to write to HDFS file '%s': %s", handle.path, status.Message());
 	}
 	h.position += (idx_t)res;
 	h.length += (idx_t)res;
@@ -222,11 +308,13 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(handle.path, authority, hdfs_path);
-	auto *client = GetClient(authority);
 	hdfs_file_info_t info;
-	BridgeError err;
-	if (hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, &err) < 0) {
-		throw IOException("Failed to stat HDFS file '%s': %s", handle.path, err.Get());
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to stat HDFS file '%s': %s", handle.path, status.Message());
 	}
 	// HDFS modification times are epoch milliseconds.
 	return Timestamp::FromEpochMs((int64_t)info.mtime);
@@ -236,36 +324,49 @@ bool HdfsFileSystem::FileExists(const string &filename, optional_ptr<FileOpener>
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(filename, authority, hdfs_path);
-	auto *client = GetClient(authority);
 	hdfs_file_info_t info;
-	BridgeError err;
-	if (hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, &err) < 0) {
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	});
+	if (status.Ok()) {
+		return !info.is_dir;
+	}
+	if (status.IsNotFound()) {
 		return false;
 	}
-	return !info.is_dir;
+	// A connection/permission error is not the same as "does not exist".
+	throw IOException("Failed to check HDFS file '%s': %s", filename, status.Message());
 }
 
 bool HdfsFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
-	auto *client = GetClient(authority);
 	hdfs_file_info_t info;
-	BridgeError err;
-	if (hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, &err) < 0) {
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	});
+	if (status.Ok()) {
+		return info.is_dir;
+	}
+	if (status.IsNotFound()) {
 		return false;
 	}
-	return info.is_dir;
+	throw IOException("Failed to check HDFS directory '%s': %s", directory, status.Message());
 }
 
 void HdfsFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
-	auto *client = GetClient(authority);
-	BridgeError err;
-	if (hdfs_bridge_mkdirs(client, hdfs_path.c_str(), &err) < 0) {
-		throw IOException("Failed to create HDFS directory '%s': %s", directory, err.Get());
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_mkdirs(client, hdfs_path.c_str(), st) == 0;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to create HDFS directory '%s': %s", directory, status.Message());
 	}
 }
 
@@ -273,10 +374,12 @@ void HdfsFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileO
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
-	auto *client = GetClient(authority);
-	BridgeError err;
-	if (hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/true, &err) < 0) {
-		throw IOException("Failed to remove HDFS directory '%s': %s", directory, err.Get());
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/true, st) == 0;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to remove HDFS directory '%s': %s", directory, status.Message());
 	}
 }
 
@@ -284,10 +387,12 @@ void HdfsFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener>
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(filename, authority, hdfs_path);
-	auto *client = GetClient(authority);
-	BridgeError err;
-	if (hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/false, &err) < 0) {
-		throw IOException("Failed to remove HDFS file '%s': %s", filename, err.Get());
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/false, st) == 0;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to remove HDFS file '%s': %s", filename, status.Message());
 	}
 }
 
@@ -299,10 +404,18 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target,
 	string dst_authority;
 	string dst_path;
 	ParseHdfsPath(target, dst_authority, dst_path);
-	auto *client = GetClient(src_authority);
-	BridgeError err;
-	if (hdfs_bridge_rename(client, src_path.c_str(), dst_path.c_str(), /*overwrite=*/true, &err) < 0) {
-		throw IOException("Failed to move HDFS file '%s' -> '%s': %s", source, target, err.Get());
+	// HDFS rename is a single-NameNode operation; a cross-authority move would
+	// previously have silently renamed within the source cluster.
+	if (src_authority != dst_authority) {
+		throw NotImplementedException(
+		    "Cannot move HDFS files across different NameNodes ('%s' -> '%s')", source, target);
+	}
+	BridgeStatus status;
+	Execute(src_authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_rename(client, src_path.c_str(), dst_path.c_str(), /*overwrite=*/true, st) == 0;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to move HDFS file '%s' -> '%s': %s", source, target, status.Message());
 	}
 }
 
@@ -312,16 +425,18 @@ bool HdfsFileSystem::ListFiles(const string &directory,
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
-	auto *client = GetClient(authority);
 
 	int32_t count = 0;
-	BridgeError err;
-	auto *entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), &count, &err);
-	if (!entries) {
-		if (err.msg) {
-			throw IOException("Failed to list HDFS directory '%s': %s", directory, err.Get());
-		}
-		return false; // empty directory
+	hdfs_dir_entry_t *entries = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), &count, st);
+		// A null result with an OK status is an empty directory, not a failure;
+		// the status code is the sole success signal.
+		return st->code == HDFS_OK;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to list HDFS directory '%s': %s", directory, status.Message());
 	}
 	for (int32_t i = 0; i < count; i++) {
 		// ListFiles reports bare child names, not full paths.
@@ -333,7 +448,9 @@ bool HdfsFileSystem::ListFiles(const string &directory,
 		}
 		callback(name, entries[i].is_dir);
 	}
-	hdfs_bridge_free_dir_entries(entries, count);
+	if (entries) {
+		hdfs_bridge_free_dir_entries(entries, count);
+	}
 	return count > 0;
 }
 
@@ -341,24 +458,27 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(path, authority, hdfs_path);
-	auto *client = GetClient(authority);
 
 	int32_t count = 0;
-	BridgeError err;
-	auto *entries = hdfs_bridge_glob(client, hdfs_path.c_str(), &count, &err);
-	vector<OpenFileInfo> result;
-	if (!entries) {
-		if (err.msg) {
-			throw IOException("Failed to glob HDFS path '%s': %s", path, err.Get());
-		}
-		return result; // no matches
+	hdfs_dir_entry_t *entries = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		entries = hdfs_bridge_glob(client, hdfs_path.c_str(), &count, st);
+		// Null + OK means "no matches"; only a non-OK status is an error.
+		return st->code == HDFS_OK;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to glob HDFS path '%s': %s", path, status.Message());
 	}
+	vector<OpenFileInfo> result;
 	result.reserve(count);
 	for (int32_t i = 0; i < count; i++) {
 		string child = entries[i].path ? string(entries[i].path) : string();
 		result.emplace_back(MakeUrl(authority, child));
 	}
-	hdfs_bridge_free_dir_entries(entries, count);
+	if (entries) {
+		hdfs_bridge_free_dir_entries(entries, count);
+	}
 	return result;
 }
 

@@ -3,11 +3,13 @@
 //!
 //! ## Conventions
 //!
-//! * Every fallible function takes a trailing `out_err: *mut *mut c_char`. On
-//!   success it is left untouched (the caller initializes it to null). On
-//!   failure the function writes a heap-allocated, NUL-terminated error message
-//!   to `*out_err` and returns a sentinel (null pointer, or `-1`). The caller
-//!   must free that string with [`hdfs_bridge_free_string`].
+//! * Every fallible function takes a trailing `status: *mut Status`. On success
+//!   it is left untouched (the caller initializes it to `{HDFS_OK, null}`). On
+//!   failure the function writes a category code and a heap-allocated,
+//!   NUL-terminated message; the caller must free the message with
+//!   [`hdfs_bridge_free_string`]. The category lets the C++ side react to the
+//!   *kind* of failure (not-found vs unreachable cluster vs bad argument)
+//!   without parsing message strings.
 //! * Opaque handles (`Client`, `FileReader`, `FileWriter`) are returned as raw
 //!   `Box` pointers and must be released with their matching `free`/`close`
 //!   function.
@@ -22,6 +24,7 @@ use std::slice;
 
 use hdfs_native::client::WriteOptions;
 use hdfs_native::sync::{Client, ClientBuilder, FileReader, FileWriter};
+use hdfs_native::HdfsError;
 
 // The C++ filesystem issues concurrent positional reads against a single
 // `FileReader` (DuckDB's parquet reader reads ranges from multiple threads on
@@ -32,6 +35,24 @@ const _: fn() = || {
     assert_send_sync::<FileReader>();
     assert_send_sync::<Client>();
 };
+
+// Error categories shared with the C++ side. Keep in sync with
+// `hdfs_error_code_t` in `hdfs_bridge.h`.
+#[allow(dead_code)] // success leaves status untouched; kept for parity with the header
+const HDFS_OK: i32 = 0;
+const HDFS_ERR_IO: i32 = 1;
+const HDFS_ERR_NOT_FOUND: i32 = 2;
+const HDFS_ERR_PERMISSION: i32 = 3;
+const HDFS_ERR_ALREADY_EXISTS: i32 = 4;
+const HDFS_ERR_CONNECTION: i32 = 5;
+const HDFS_ERR_INVALID_ARGUMENT: i32 = 6;
+
+/// FFI result struct, mirrored by `hdfs_status_t` in `hdfs_bridge.h`.
+#[repr(C)]
+pub struct Status {
+    pub code: i32,
+    pub msg: *mut c_char,
+}
 
 /// Information about a single file or directory, mirrored in `hdfs_bridge.h`.
 #[repr(C)]
@@ -53,18 +74,82 @@ pub struct DirEntry {
 
 // --- error helpers ---------------------------------------------------------
 
-/// Write `msg` into `*out_err` as an owned C string, if `out_err` is non-null.
-unsafe fn set_error(out_err: *mut *mut c_char, msg: impl std::fmt::Display) {
-    if out_err.is_null() {
+/// Map an `HdfsError` to one of the FFI error categories. The RPC and IO arms
+/// dig into the underlying Hadoop exception class / IO error kind so the C++
+/// side can, for example, distinguish "access denied" or "namenode in standby"
+/// (retryable) from a generic failure.
+fn classify(err: &HdfsError) -> i32 {
+    match err {
+        HdfsError::FileNotFound(_) => HDFS_ERR_NOT_FOUND,
+        HdfsError::AlreadyExists(_) => HDFS_ERR_ALREADY_EXISTS,
+        HdfsError::InvalidPath(_)
+        | HdfsError::InvalidArgument(_)
+        | HdfsError::UrlParseError(_) => HDFS_ERR_INVALID_ARGUMENT,
+        HdfsError::RPCError(class, _) | HdfsError::FatalRPCError(class, _) => classify_rpc(class),
+        HdfsError::SASLError(_)
+        | HdfsError::GSSAPIError(..)
+        | HdfsError::NoSASLMechanism
+        | HdfsError::DataTransferError(_)
+        | HdfsError::BlocksNotFound(_) => HDFS_ERR_CONNECTION,
+        HdfsError::IOError(io) => classify_io(io),
+        _ => HDFS_ERR_IO,
+    }
+}
+
+/// Classify a Hadoop server-side exception by its Java class name.
+fn classify_rpc(class: &str) -> i32 {
+    if class.contains("AccessControlException") || class.contains("SecurityException") {
+        HDFS_ERR_PERMISSION
+    } else if class.contains("FileNotFoundException") {
+        HDFS_ERR_NOT_FOUND
+    } else if class.contains("FileAlreadyExistsException") || class.contains("AlreadyBeingCreated") {
+        HDFS_ERR_ALREADY_EXISTS
+    } else if class.contains("StandbyException") || class.contains("RetriableException") {
+        // Namenode failover / retryable: the cached client should reconnect.
+        HDFS_ERR_CONNECTION
+    } else {
+        HDFS_ERR_IO
+    }
+}
+
+/// Classify a transport-level `std::io::Error` from the Rust side.
+fn classify_io(io: &std::io::Error) -> i32 {
+    use std::io::ErrorKind;
+    match io.kind() {
+        ErrorKind::NotFound => HDFS_ERR_NOT_FOUND,
+        ErrorKind::PermissionDenied => HDFS_ERR_PERMISSION,
+        ErrorKind::AlreadyExists => HDFS_ERR_ALREADY_EXISTS,
+        ErrorKind::ConnectionRefused
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::NotConnected
+        | ErrorKind::BrokenPipe
+        | ErrorKind::TimedOut
+        | ErrorKind::UnexpectedEof => HDFS_ERR_CONNECTION,
+        _ => HDFS_ERR_IO,
+    }
+}
+
+/// Write `code` and `msg` into `*status`, if `status` is non-null.
+unsafe fn set_status(status: *mut Status, code: i32, msg: impl std::fmt::Display) {
+    if status.is_null() {
         return;
     }
-    let s = msg.to_string();
     // Replace interior NULs so CString::new never fails.
-    let cleaned: String = s.replace('\0', " ");
-    match CString::new(cleaned) {
-        Ok(c) => unsafe { *out_err = c.into_raw() },
-        Err(_) => unsafe { *out_err = ptr::null_mut() },
+    let cleaned: String = msg.to_string().replace('\0', " ");
+    let cmsg = match CString::new(cleaned) {
+        Ok(c) => c.into_raw(),
+        Err(_) => ptr::null_mut(),
+    };
+    unsafe {
+        (*status).code = code;
+        (*status).msg = cmsg;
     }
+}
+
+/// Write a classified `HdfsError` with a context prefix into `*status`.
+unsafe fn set_error(status: *mut Status, context: impl std::fmt::Display, err: &HdfsError) {
+    unsafe { set_status(status, classify(err), format_args!("{context}: {err}")) }
 }
 
 /// Convert a C string pointer into an owned `String`, returning `None` for null
@@ -77,7 +162,7 @@ unsafe fn opt_str(ptr: *const c_char) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Free a C string previously returned by the bridge (error messages, etc.).
+/// Free a C string previously returned by the bridge (status messages, etc.).
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_free_string(s: *mut c_char) {
     if !s.is_null() {
@@ -94,7 +179,7 @@ pub unsafe extern "C" fn hdfs_bridge_connect(
     url: *const c_char,
     config_dir: *const c_char,
     user: *const c_char,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> *mut Client {
     let mut builder = ClientBuilder::new();
     if let Some(url) = unsafe { opt_str(url) } {
@@ -110,7 +195,7 @@ pub unsafe extern "C" fn hdfs_bridge_connect(
     match builder.build() {
         Ok(client) => Box::into_raw(Box::new(client)),
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("failed to connect to HDFS: {e}")) };
+            unsafe { set_error(status, "failed to connect to HDFS", &e) };
             ptr::null_mut()
         }
     }
@@ -126,13 +211,13 @@ pub unsafe extern "C" fn hdfs_bridge_free_client(client: *mut Client) {
 // --- stat ------------------------------------------------------------------
 
 /// Fill `out` with metadata for `path`. Returns 0 on success, -1 on error
-/// (including not-found).
+/// (including not-found; check `status->code`).
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_get_file_info(
     client: *mut Client,
     path: *const c_char,
     out: *mut FileInfo,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
@@ -146,19 +231,10 @@ pub unsafe extern "C" fn hdfs_bridge_get_file_info(
             0
         }
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("stat '{path}' failed: {e}")) };
+            unsafe { set_error(status, format_args!("stat '{path}' failed"), &e) };
             -1
         }
     }
-}
-
-/// Return true if `path` exists. Never reports an error: missing paths and
-/// connection issues alike map to false.
-#[no_mangle]
-pub unsafe extern "C" fn hdfs_bridge_exists(client: *mut Client, path: *const c_char) -> bool {
-    let client = unsafe { &*client };
-    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    client.get_file_info(&path).is_ok()
 }
 
 // --- reader ----------------------------------------------------------------
@@ -167,14 +243,14 @@ pub unsafe extern "C" fn hdfs_bridge_exists(client: *mut Client, path: *const c_
 pub unsafe extern "C" fn hdfs_bridge_open(
     client: *mut Client,
     path: *const c_char,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> *mut FileReader {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
     match client.read(&path) {
         Ok(reader) => Box::into_raw(Box::new(reader)),
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("open '{path}' for reading failed: {e}")) };
+            unsafe { set_error(status, format_args!("open '{path}' for reading failed"), &e) };
             ptr::null_mut()
         }
     }
@@ -203,10 +279,10 @@ pub unsafe extern "C" fn hdfs_bridge_read_range(
     buf: *mut u8,
     len: i64,
     offset: u64,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i64 {
     if len < 0 {
-        unsafe { set_error(out_err, "negative read length") };
+        unsafe { set_status(status, HDFS_ERR_INVALID_ARGUMENT, "negative read length") };
         return -1;
     }
     let reader = unsafe { &*reader };
@@ -214,7 +290,7 @@ pub unsafe extern "C" fn hdfs_bridge_read_range(
     match reader.read_range_buf(slice, offset as usize) {
         Ok(()) => len,
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("read at offset {offset} failed: {e}")) };
+            unsafe { set_error(status, format_args!("read at offset {offset} failed"), &e) };
             -1
         }
     }
@@ -229,7 +305,7 @@ pub unsafe extern "C" fn hdfs_bridge_create(
     client: *mut Client,
     path: *const c_char,
     overwrite: bool,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> *mut FileWriter {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
@@ -237,7 +313,7 @@ pub unsafe extern "C" fn hdfs_bridge_create(
     match client.create(&path, opts) {
         Ok(writer) => Box::into_raw(Box::new(writer)),
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("create '{path}' for writing failed: {e}")) };
+            unsafe { set_error(status, format_args!("create '{path}' for writing failed"), &e) };
             ptr::null_mut()
         }
     }
@@ -249,10 +325,10 @@ pub unsafe extern "C" fn hdfs_bridge_write(
     writer: *mut FileWriter,
     buf: *const u8,
     len: i64,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i64 {
     if len < 0 {
-        unsafe { set_error(out_err, "negative write length") };
+        unsafe { set_status(status, HDFS_ERR_INVALID_ARGUMENT, "negative write length") };
         return -1;
     }
     let writer = unsafe { &mut *writer };
@@ -260,7 +336,8 @@ pub unsafe extern "C" fn hdfs_bridge_write(
     match writer.write_all(slice) {
         Ok(()) => len,
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("write failed: {e}")) };
+            // write_all comes from std::io::Write, so this is a std::io::Error.
+            unsafe { set_status(status, classify_io(&e), format_args!("write failed: {e}")) };
             -1
         }
     }
@@ -271,7 +348,7 @@ pub unsafe extern "C" fn hdfs_bridge_write(
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_close_writer(
     writer: *mut FileWriter,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i32 {
     if writer.is_null() {
         return 0;
@@ -280,7 +357,7 @@ pub unsafe extern "C" fn hdfs_bridge_close_writer(
     match writer.close() {
         Ok(()) => 0,
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("close writer failed: {e}")) };
+            unsafe { set_error(status, "close writer failed", &e) };
             -1
         }
     }
@@ -316,12 +393,13 @@ fn statuses_to_entries(
 }
 
 /// Glob `pattern`, returning matching entries. `out_count` receives the count.
+/// A null return with `status->code == HDFS_OK` means no matches.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_glob(
     client: *mut Client,
     pattern: *const c_char,
     out_count: *mut i32,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let pattern = unsafe { CStr::from_ptr(pattern) }.to_string_lossy();
@@ -330,20 +408,21 @@ pub unsafe extern "C" fn hdfs_bridge_glob(
         Err(e) => {
             unsafe {
                 *out_count = 0;
-                set_error(out_err, format_args!("glob '{pattern}' failed: {e}"));
+                set_error(status, format_args!("glob '{pattern}' failed"), &e);
             }
             ptr::null_mut()
         }
     }
 }
 
-/// List the immediate children of directory `path` (non-recursive).
+/// List the immediate children of directory `path` (non-recursive). A null
+/// return with `status->code == HDFS_OK` means an empty directory.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_list_status(
     client: *mut Client,
     path: *const c_char,
     out_count: *mut i32,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
@@ -352,7 +431,7 @@ pub unsafe extern "C" fn hdfs_bridge_list_status(
         Err(e) => {
             unsafe {
                 *out_count = 0;
-                set_error(out_err, format_args!("list '{path}' failed: {e}"));
+                set_error(status, format_args!("list '{path}' failed"), &e);
             }
             ptr::null_mut()
         }
@@ -380,37 +459,38 @@ pub unsafe extern "C" fn hdfs_bridge_free_dir_entries(entries: *mut DirEntry, co
 pub unsafe extern "C" fn hdfs_bridge_mkdirs(
     client: *mut Client,
     path: *const c_char,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
     match client.mkdirs(&path, 0o755, true) {
         Ok(()) => 0,
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("mkdirs '{path}' failed: {e}")) };
+            unsafe { set_error(status, format_args!("mkdirs '{path}' failed"), &e) };
             -1
         }
     }
 }
 
 /// Delete `path`. `recursive` must be true to remove a non-empty directory.
+/// A server response of "false" (nothing deleted) is reported as not-found.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_delete(
     client: *mut Client,
     path: *const c_char,
     recursive: bool,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
     match client.delete(&path, recursive) {
         Ok(true) => 0,
         Ok(false) => {
-            unsafe { set_error(out_err, format_args!("delete '{path}' returned false")) };
+            unsafe { set_status(status, HDFS_ERR_NOT_FOUND, format_args!("delete '{path}': path not found")) };
             -1
         }
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("delete '{path}' failed: {e}")) };
+            unsafe { set_error(status, format_args!("delete '{path}' failed"), &e) };
             -1
         }
     }
@@ -423,7 +503,7 @@ pub unsafe extern "C" fn hdfs_bridge_rename(
     src: *const c_char,
     dst: *const c_char,
     overwrite: bool,
-    out_err: *mut *mut c_char,
+    status: *mut Status,
 ) -> i32 {
     let client = unsafe { &*client };
     let src = unsafe { CStr::from_ptr(src) }.to_string_lossy();
@@ -431,7 +511,7 @@ pub unsafe extern "C" fn hdfs_bridge_rename(
     match client.rename(&src, &dst, overwrite) {
         Ok(()) => 0,
         Err(e) => {
-            unsafe { set_error(out_err, format_args!("rename '{src}' -> '{dst}' failed: {e}")) };
+            unsafe { set_error(status, format_args!("rename '{src}' -> '{dst}' failed"), &e) };
             -1
         }
     }
