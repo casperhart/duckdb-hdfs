@@ -1,6 +1,7 @@
 # name: test/sql/hdfs.test
 # description: Integration tests for the hdfs extension against a real HDFS.
-# group: [hdfs]
+# group: [sql]
+
 #
 # These tests require a running HDFS cluster (see test/docker) and the host-side
 # client config on HADOOP_CONF_DIR. The easiest way to run them:

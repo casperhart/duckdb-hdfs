@@ -46,7 +46,7 @@ shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const hdfs_dir_entry_t &entry)
 	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
 	options.emplace("file_size", Value::BIGINT(entry.length));
 	// HDFS modification times are epoch milliseconds.
-	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs((int64_t)entry.mtime)));
+	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime))));
 	return ext;
 }
 
@@ -243,7 +243,7 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlag
 	}
 	auto handle = make_uniq<HdfsFileHandle>(*this, path, flags, reader, nullptr);
 	int64_t size = hdfs_bridge_file_size(reader);
-	handle->length = size < 0 ? 0 : (idx_t)size;
+	handle->length = size < 0 ? 0 : static_cast<idx_t>(size);
 	return std::move(handle);
 }
 
@@ -256,12 +256,12 @@ void HdfsFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 		return;
 	}
 	// Bounds check written to avoid unsigned overflow on `location + nr_bytes`.
-	if (location > h.length || (idx_t)nr_bytes > h.length - location) {
-		throw IOException("Cannot read %lld bytes at offset %llu from HDFS file '%s' of size %llu",
-		                  nr_bytes, location, handle.path, h.length);
+	if (location > h.length || static_cast<idx_t>(nr_bytes) > h.length - location) {
+		throw IOException("Cannot read %lld bytes at offset %llu from HDFS file '%s' of size %llu", nr_bytes, location,
+		                  handle.path, h.length);
 	}
 	BridgeStatus status;
-	int64_t res = hdfs_bridge_read_range(h.reader, (uint8_t *)buffer, nr_bytes, location, &status);
+	int64_t res = hdfs_bridge_read_range(h.reader, reinterpret_cast<uint8_t *>(buffer), nr_bytes, location, &status);
 	if (res < 0) {
 		throw IOException("Failed to read from HDFS file '%s': %s", handle.path, status.Message());
 	}
@@ -273,14 +273,14 @@ int64_t HdfsFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes)
 		return 0;
 	}
 	int64_t to_read = nr_bytes;
-	if (h.position + (idx_t)to_read > h.length) {
-		to_read = (int64_t)(h.length - h.position);
+	if (h.position + static_cast<idx_t>(to_read) > h.length) {
+		to_read = static_cast<int64_t>(h.length - h.position);
 	}
 	if (to_read <= 0) {
 		return 0;
 	}
 	Read(handle, buffer, to_read, h.position);
-	h.position += (idx_t)to_read;
+	h.position += static_cast<idx_t>(to_read);
 	return to_read;
 }
 
@@ -294,12 +294,12 @@ int64_t HdfsFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes
 		throw IOException("File not opened for writing: " + handle.path);
 	}
 	BridgeStatus status;
-	int64_t res = hdfs_bridge_write(h.writer, (const uint8_t *)buffer, nr_bytes, &status);
+	int64_t res = hdfs_bridge_write(h.writer, reinterpret_cast<const uint8_t *>(buffer), nr_bytes, &status);
 	if (res < 0) {
 		throw IOException("Failed to write to HDFS file '%s': %s", handle.path, status.Message());
 	}
-	h.position += (idx_t)res;
-	h.length += (idx_t)res;
+	h.position += static_cast<idx_t>(res);
+	h.length += static_cast<idx_t>(res);
 	return res;
 }
 
@@ -316,7 +316,7 @@ void HdfsFileSystem::Reset(FileHandle &handle) {
 }
 
 int64_t HdfsFileSystem::GetFileSize(FileHandle &handle) {
-	return (int64_t)handle.Cast<HdfsFileHandle>().length;
+	return static_cast<int64_t>(handle.Cast<HdfsFileHandle>().length);
 }
 
 timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
@@ -332,7 +332,7 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 		throw IOException("Failed to stat HDFS file '%s': %s", handle.path, status.Message());
 	}
 	// HDFS modification times are epoch milliseconds.
-	return Timestamp::FromEpochMs((int64_t)info.mtime);
+	return Timestamp::FromEpochMs(static_cast<int64_t>(info.mtime));
 }
 
 bool HdfsFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
@@ -411,8 +411,7 @@ void HdfsFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener>
 	}
 }
 
-void HdfsFileSystem::MoveFile(const string &source, const string &target,
-                              optional_ptr<FileOpener> opener) {
+void HdfsFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	string src_authority;
 	string src_path;
 	ParseHdfsPath(source, src_authority, src_path);
@@ -422,8 +421,8 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target,
 	// HDFS rename is a single-NameNode operation; a cross-authority move would
 	// previously have silently renamed within the source cluster.
 	if (src_authority != dst_authority) {
-		throw NotImplementedException(
-		    "Cannot move HDFS files across different NameNodes ('%s' -> '%s')", source, target);
+		throw NotImplementedException("Cannot move HDFS files across different NameNodes ('%s' -> '%s')", source,
+		                              target);
 	}
 	BridgeStatus status;
 	Execute(src_authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
@@ -434,8 +433,7 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target,
 	}
 }
 
-bool HdfsFileSystem::ListFilesExtended(const string &directory,
-                                       const std::function<void(OpenFileInfo &info)> &callback,
+bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
                                        optional_ptr<FileOpener> opener) {
 	string authority;
 	string hdfs_path;

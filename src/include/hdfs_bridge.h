@@ -57,8 +57,7 @@ typedef struct {
 void hdfs_bridge_free_string(char *s);
 
 // Client management.
-hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, const char *user,
-                                   hdfs_status_t *status);
+hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, const char *user, hdfs_status_t *status);
 void hdfs_bridge_free_client(hdfs_client_t *client);
 
 // Metadata. Returns 0 on success, -1 on failure (see `status` for the category).
@@ -75,24 +74,21 @@ int64_t hdfs_bridge_read_range(hdfs_reader_t *reader, uint8_t *buf, int64_t len,
                                hdfs_status_t *status);
 
 // Writing (append-only).
-hdfs_writer_t *hdfs_bridge_create(hdfs_client_t *client, const char *path, bool overwrite,
-                                  hdfs_status_t *status);
-int64_t hdfs_bridge_write(hdfs_writer_t *writer, const uint8_t *buf, int64_t len,
-                          hdfs_status_t *status);
+hdfs_writer_t *hdfs_bridge_create(hdfs_client_t *client, const char *path, bool overwrite, hdfs_status_t *status);
+int64_t hdfs_bridge_write(hdfs_writer_t *writer, const uint8_t *buf, int64_t len, hdfs_status_t *status);
 int32_t hdfs_bridge_close_writer(hdfs_writer_t *writer, hdfs_status_t *status);
 
 // Directory operations. Returned arrays are freed with hdfs_bridge_free_dir_entries.
 // A NULL return with `status->code == HDFS_OK` means an empty result (not an error).
 hdfs_dir_entry_t *hdfs_bridge_glob(hdfs_client_t *client, const char *pattern, int32_t *out_count,
                                    hdfs_status_t *status);
-hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path,
-                                          int32_t *out_count, hdfs_status_t *status);
+hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path, int32_t *out_count,
+                                          hdfs_status_t *status);
 void hdfs_bridge_free_dir_entries(hdfs_dir_entry_t *entries, int32_t count);
 
 // Mutations.
 int32_t hdfs_bridge_mkdirs(hdfs_client_t *client, const char *path, hdfs_status_t *status);
-int32_t hdfs_bridge_delete(hdfs_client_t *client, const char *path, bool recursive,
-                           hdfs_status_t *status);
+int32_t hdfs_bridge_delete(hdfs_client_t *client, const char *path, bool recursive, hdfs_status_t *status);
 int32_t hdfs_bridge_rename(hdfs_client_t *client, const char *src, const char *dst, bool overwrite,
                            hdfs_status_t *status);
 

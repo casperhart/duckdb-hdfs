@@ -14,8 +14,7 @@ struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
 class HdfsConnection; // A reconnectable, lazily-established client for one authority.
 
 struct HdfsFileHandle : public FileHandle {
-	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, hdfs_reader_t *reader,
-	               hdfs_writer_t *writer)
+	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, hdfs_reader_t *reader, hdfs_writer_t *writer)
 	    : FileHandle(fs, std::move(path), flags), reader(reader), writer(writer) {
 	}
 
@@ -65,15 +64,13 @@ public:
 	// Extended listing: each entry carries type/size/last-modified in
 	// OpenFileInfo::extended_info, so DuckDB doesn't re-stat per file. The base
 	// FileSystem::ListFiles(name, is_dir) overload routes through this.
-	bool ListFilesExtended(const string &directory,
-	                       const std::function<void(OpenFileInfo &info)> &callback,
+	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
 	                       optional_ptr<FileOpener> opener) override;
 	bool SupportsListFilesExtended() const override {
 		return true;
 	}
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
-	void MoveFile(const string &source, const string &target,
-	              optional_ptr<FileOpener> opener = nullptr) override;
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 	// HDFS has no mid-stream flush in the sync API; data is durable on Close().
 	void FileSync(FileHandle &handle) override {
 	}

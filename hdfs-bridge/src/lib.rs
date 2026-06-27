@@ -82,9 +82,9 @@ fn classify(err: &HdfsError) -> i32 {
     match err {
         HdfsError::FileNotFound(_) => HDFS_ERR_NOT_FOUND,
         HdfsError::AlreadyExists(_) => HDFS_ERR_ALREADY_EXISTS,
-        HdfsError::InvalidPath(_)
-        | HdfsError::InvalidArgument(_)
-        | HdfsError::UrlParseError(_) => HDFS_ERR_INVALID_ARGUMENT,
+        HdfsError::InvalidPath(_) | HdfsError::InvalidArgument(_) | HdfsError::UrlParseError(_) => {
+            HDFS_ERR_INVALID_ARGUMENT
+        }
         HdfsError::RPCError(class, _) | HdfsError::FatalRPCError(class, _) => classify_rpc(class),
         HdfsError::SASLError(_)
         | HdfsError::GSSAPIError(..)
@@ -102,7 +102,8 @@ fn classify_rpc(class: &str) -> i32 {
         HDFS_ERR_PERMISSION
     } else if class.contains("FileNotFoundException") {
         HDFS_ERR_NOT_FOUND
-    } else if class.contains("FileAlreadyExistsException") || class.contains("AlreadyBeingCreated") {
+    } else if class.contains("FileAlreadyExistsException") || class.contains("AlreadyBeingCreated")
+    {
         HDFS_ERR_ALREADY_EXISTS
     } else if class.contains("StandbyException") || class.contains("RetriableException") {
         // Namenode failover / retryable: the cached client should reconnect.
@@ -158,8 +159,14 @@ unsafe fn opt_str(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
-    if s.is_empty() { None } else { Some(s) }
+    let s = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Free a C string previously returned by the bridge (status messages, etc.).
@@ -309,11 +316,19 @@ pub unsafe extern "C" fn hdfs_bridge_create(
 ) -> *mut FileWriter {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    let opts = WriteOptions::default().overwrite(overwrite).create_parent(true);
+    let opts = WriteOptions::default()
+        .overwrite(overwrite)
+        .create_parent(true);
     match client.create(&path, opts) {
         Ok(writer) => Box::into_raw(Box::new(writer)),
         Err(e) => {
-            unsafe { set_error(status, format_args!("create '{path}' for writing failed"), &e) };
+            unsafe {
+                set_error(
+                    status,
+                    format_args!("create '{path}' for writing failed"),
+                    &e,
+                )
+            };
             ptr::null_mut()
         }
     }
@@ -486,7 +501,13 @@ pub unsafe extern "C" fn hdfs_bridge_delete(
     match client.delete(&path, recursive) {
         Ok(true) => 0,
         Ok(false) => {
-            unsafe { set_status(status, HDFS_ERR_NOT_FOUND, format_args!("delete '{path}': path not found")) };
+            unsafe {
+                set_status(
+                    status,
+                    HDFS_ERR_NOT_FOUND,
+                    format_args!("delete '{path}': path not found"),
+                )
+            };
             -1
         }
         Err(e) => {
