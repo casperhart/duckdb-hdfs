@@ -7,5 +7,5 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-hdfs-native = { git = "https://github.com/casperhart/hdfs-native", branch = "kms" }
+hdfs-native = { git = "https://github.com/casperhart/hdfs-native", branch = "kms", features = ["kms-rustls-tls"] }
 libc = "0.2"
