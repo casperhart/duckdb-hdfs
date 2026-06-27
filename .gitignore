@@ -6,3 +6,9 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+
+# clangd index cache
+.cache/
+
+# Rust bridge build output
+hdfs-bridge/target/

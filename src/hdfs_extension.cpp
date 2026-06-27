@@ -1,47 +1,26 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "hdfs_extension.hpp"
-#include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
-// OpenSSL linked through vcpkg
-#include <openssl/opensslv.h>
+#include "duckdb.hpp"
+
+#include "hdfs_filesystem.hpp"
 
 namespace duckdb {
 
-inline void HdfsScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &name_vector = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name) {
-		return StringVector::AddString(result, "...........🦆 " + name.GetString());
-	});
-}
-
-inline void HdfsOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &name_vector = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name) {
-		return StringVector::AddString(result, "Hdfs " + name.GetString() + ", my linked OpenSSL version is " +
-		                                           OPENSSL_VERSION_TEXT);
-	});
-}
-
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register a scalar function
-	auto hdfs_scalar_function =
-	    ScalarFunction("hdfs", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HdfsScalarFun);
-
-	loader.RegisterFunction(hdfs_scalar_function);
-
-	// Register another scalar function
-	auto hdfs_openssl_version_scalar_function = ScalarFunction("hdfs_openssl_version", {LogicalType::VARCHAR},
-	                                                             LogicalType::VARCHAR, HdfsOpenSSLVersionScalarFun);
-	loader.RegisterFunction(hdfs_openssl_version_scalar_function);
+	// Register the hdfs:// virtual filesystem. Connection config (Hadoop config
+	// dir, effective user, Kerberos) is resolved by hdfs-native from the
+	// standard Hadoop environment (HADOOP_CONF_DIR / HADOOP_HOME, HADOOP_USER_NAME
+	// / keytab / current account), so there are no extension settings to register.
+	auto &fs = loader.GetDatabaseInstance().GetFileSystem();
+	fs.RegisterSubSystem(make_uniq<HdfsFileSystem>());
 }
 
 void HdfsExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
+
 std::string HdfsExtension::Name() {
 	return "hdfs";
 }

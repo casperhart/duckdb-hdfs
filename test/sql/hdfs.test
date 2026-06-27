@@ -1,23 +1,95 @@
 # name: test/sql/hdfs.test
-# description: test hdfs extension
-# group: [sql]
+# description: Integration tests for the hdfs extension against a real HDFS.
+# group: [hdfs]
+#
+# These tests require a running HDFS cluster (see test/docker) and the host-side
+# client config on HADOOP_CONF_DIR. The easiest way to run them:
+#
+#     make                              # build the extension + duckdb
+#     test/scripts/run_hdfs_tests.sh    # up -> run -> down
+#
+# They are skipped unless HDFS_TEST_RUNNING is set, so `make test` stays green
+# without docker.
 
-# Before we load the extension, this will fail
-statement error
-SELECT hdfs('Sam');
-----
-Catalog Error: Scalar Function with name hdfs does not exist!
-
-# Require statement will ensure this test is run with this extension loaded
 require hdfs
 
-# Confirm the extension works
-query I
-SELECT hdfs('Sam');
-----
-...........🦆 Sam
+require parquet
+
+require-env HDFS_TEST_RUNNING
+
+# The effective user comes from the Hadoop environment (HADOOP_USER_NAME here,
+# set by run_hdfs_tests.sh) so writes to the hadoop-owned /test are permitted.
+
+# --- reading CSV over hdfs:// ------------------------------------------------
 
 query I
-SELECT hdfs_openssl_version('Michael') ILIKE 'Hdfs Michael, my linked OpenSSL version is OpenSSL%';
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
 ----
-true
+3
+
+query IT
+SELECT id, name FROM read_csv('hdfs://localhost:9000/test/data.csv') ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+# --- reading Parquet over hdfs:// --------------------------------------------
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
+----
+5
+
+query IT
+SELECT id, name FROM read_parquet('hdfs://localhost:9000/test/data.parquet') ORDER BY id LIMIT 1;
+----
+0	v0
+
+# --- globbing ----------------------------------------------------------------
+
+# Wildcard against the two seeded fixtures (data.csv + data.parquet). Patterned
+# on "data.*" so it stays deterministic even if other files are written below.
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/test/data.*');
+----
+2
+
+# A single '*' matches one path level only (not the nested/ subdirectory).
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/test/*.parquet');
+----
+1
+
+# Reading a glob pattern directly expands to the matching files.
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data*.csv');
+----
+3
+
+# --- writing (COPY TO) then reading back -------------------------------------
+# Writes go under nested/ so they can't perturb the /test/*.{csv,parquet} globs.
+
+statement ok
+COPY (SELECT 42 AS x, 'written' AS y) TO 'hdfs://localhost:9000/test/nested/written.parquet' (FORMAT parquet);
+
+query IT
+SELECT x, y FROM read_parquet('hdfs://localhost:9000/test/nested/written.parquet');
+----
+42	written
+
+# Round-trip a larger relation through CSV.
+statement ok
+COPY (SELECT range AS n FROM range(1000)) TO 'hdfs://localhost:9000/test/nested/big.csv' (FORMAT csv, HEADER);
+
+query II
+SELECT count(*), sum(n) FROM read_csv('hdfs://localhost:9000/test/nested/big.csv');
+----
+1000	499500
+
+# --- error handling ----------------------------------------------------------
+
+# Opening a non-existent file surfaces a clear IO error.
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
+----

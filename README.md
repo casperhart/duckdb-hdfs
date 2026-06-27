@@ -1,102 +1,109 @@
-# Quack
+# DuckDB HDFS extension
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+`hdfs` adds a native HDFS filesystem to DuckDB, letting you read and write files
+on Hadoop HDFS directly via `hdfs://` URLs — no JVM, no `libhdfs`. It is backed
+by the pure-Rust [`hdfs-native`](https://github.com/Kimahriman/hdfs-native)
+client through a thin C FFI bridge (`hdfs-bridge/`).
 
----
+```sql
+-- Read
+SELECT * FROM 'hdfs://namenode:8020/data/events/*.parquet';
+SELECT * FROM read_csv('hdfs://namenode:8020/data/users.csv');
 
-This extension, Quack, allow you to ... <extension_goal>.
+-- Write
+COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORMAT parquet);
+```
 
+## What works
+
+- Reading any file format DuckDB supports (Parquet, CSV, JSON, …) over `hdfs://`.
+- Writing via `COPY ... TO 'hdfs://...'` (HDFS is append-only; random writes are
+  not supported).
+- Globbing (`hdfs://host:port/dir/*.parquet`), directory listing, `FileExists`,
+  size/last-modified metadata.
+- Directory and file management: create/remove directories, remove files, rename
+  (move).
+- Concurrent positional reads (DuckDB's parallel Parquet reader) on a single
+  handle.
+
+## URL / authority handling
+
+Paths are `hdfs://<host>:<port>/<path>`. The `host:port` authority selects the
+NameNode. A scheme-only default-FS form (`hdfs:///path`) uses the NameNode from
+your Hadoop config (`fs.defaultFS`).
+
+## Configuration
+
+There are no extension-specific settings — connection config is resolved by
+`hdfs-native` from the standard Hadoop environment, exactly as the Hadoop CLI
+tools do:
+
+- **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`, or
+  failing that `HADOOP_HOME/etc/hadoop`.
+- **Effective user**: `HADOOP_USER_NAME` (or `HADOOP_PROXY_USER`), else the
+  current OS account; on a Kerberos-secured cluster the identity comes from the
+  ticket/keytab.
+
+```sh
+export HADOOP_CONF_DIR=/etc/hadoop/conf
+export HADOOP_USER_NAME=analytics   # only on non-secure clusters
+```
+
+In an embedded context (e.g. Python), set these in the environment before the
+first HDFS access — the client is created lazily on first use.
 
 ## Building
-### Managing dependencies
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-Note: VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. Note that the example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
 
-### Build steps
-Now to build the extension, run:
+Requires a Rust toolchain (for the bridge) plus the usual DuckDB extension
+build prerequisites; dependencies are managed with vcpkg.
+
 ```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/quack/quack.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `quack.duckdb_extension` is the loadable binary as it would be distributed.
-
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
-
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `quack()` that takes a string arguments and returns a string:
-```
-D select quack('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
+make            # builds hdfs-bridge (cargo) + the extension + duckdb
 ```
 
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
+Artifacts:
+
+- `build/release/duckdb` — shell with the extension statically linked.
+- `build/release/extension/hdfs/hdfs.duckdb_extension` — loadable extension.
+- `build/release/test/unittest` — DuckDB test runner.
+
+## Testing
+
+Unit/SQL tests that don't need a cluster run with:
+
 ```sh
 make test
 ```
 
-### Installing the deployed binaries
-To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. Some examples:
+The HDFS integration tests (`test/sql/hdfs.test`) run against a real single-node
+HDFS in Docker. They are gated behind `require-env HDFS_TEST_RUNNING`, so they
+are skipped by `make test` unless a cluster is up.
 
-CLI:
-```shell
-duckdb -unsigned
+To run them end-to-end (requires Docker):
+
+```sh
+make                              # ensure duckdb + extension are built
+test/scripts/run_hdfs_tests.sh    # builds image, starts HDFS, runs tests, tears down
 ```
 
-Python:
-```python
-con = duckdb.connect(':memory:', config={'allow_unsigned_extensions' : 'true'})
+Or manage the cluster manually:
+
+```sh
+test/scripts/hdfs_up.sh           # build image, start HDFS, seed fixtures under /test
+HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="$(pwd)/test/hdfs-conf" \
+    build/release/test/unittest test/sql/hdfs.test
+test/scripts/hdfs_down.sh
 ```
 
-NodeJS:
-```js
-db = new duckdb.Database(':memory:', {"allow_unsigned_extensions": "true"});
-```
+See `test/docker/` for the cluster definition. The one detail that makes HDFS
+reachable from the host (outside Docker's network) is advertising the DataNode
+as `localhost` and setting `dfs.client.use.datanode.hostname=true` on the client
+(`test/hdfs-conf/hdfs-site.xml`).
 
-Secondly, you will need to set the repository endpoint in DuckDB to the HTTP url of your bucket + version of the extension
-you want to install. To do this run the following SQL query in DuckDB:
-```sql
-SET custom_extension_repository='bucket.s3.eu-west-1.amazonaws.com/<your_extension_name>/latest';
-```
-Note that the `/latest` path will allow you to install the latest extension version available for your current version of
-DuckDB. To specify a specific version, you can pass the version instead.
+## Layout
 
-After running these steps, you can install and load your extension using the regular INSTALL/LOAD commands in DuckDB:
-```sql
-INSTALL quack;
-LOAD quack;
-```
-
-## Setting up CLion
-
-### Opening project
-Configuring CLion with this extension requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
-
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
-
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+- `src/` — DuckDB extension (C++): `hdfs_extension.cpp` registers the filesystem
+  and settings; `hdfs_filesystem.cpp` implements the `FileSystem`.
+- `src/include/hdfs_bridge.h` — C ABI exposed by the Rust bridge.
+- `hdfs-bridge/` — Rust staticlib wrapping `hdfs-native` behind that C ABI.
+- `test/` — SQL tests, Docker cluster, and helper scripts.

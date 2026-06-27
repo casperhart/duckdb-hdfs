@@ -1,0 +1,11 @@
+# Single-node HDFS used by the integration tests.
+# Brought up/down via test/scripts/hdfs_up.sh and hdfs_down.sh.
+services:
+  hdfs:
+    build: .
+    image: duckdb-hdfs-test:latest
+    container_name: duckdb-hdfs-test
+    ports:
+      - "9000:9000"   # NameNode RPC
+      - "9866:9866"   # DataNode data transfer
+      - "9870:9870"   # NameNode web UI (debugging)
