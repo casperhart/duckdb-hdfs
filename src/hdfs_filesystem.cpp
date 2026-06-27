@@ -255,7 +255,8 @@ void HdfsFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	if (nr_bytes == 0) {
 		return;
 	}
-	if (location + (idx_t)nr_bytes > h.length) {
+	// Bounds check written to avoid unsigned overflow on `location + nr_bytes`.
+	if (location > h.length || (idx_t)nr_bytes > h.length - location) {
 		throw IOException("Cannot read %lld bytes at offset %llu from HDFS file '%s' of size %llu",
 		                  nr_bytes, location, handle.path, h.length);
 	}
@@ -489,10 +490,17 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 	vector<OpenFileInfo> result;
 	result.reserve(count);
 	for (int32_t i = 0; i < count; i++) {
+		// glob_status matches directories too (e.g. "dir/*" yields subdirs). We
+		// don't implement the extended-glob path, so DuckDB wraps these results
+		// without filtering and would try to open a directory as a data file.
+		// Drop directories here so only files reach the multi-file readers.
+		if (entries[i].is_dir) {
+			continue;
+		}
 		string child = entries[i].path ? string(entries[i].path) : string();
 		OpenFileInfo info(MakeUrl(authority, child));
-		// Carry the metadata the glob already returned so DuckDB can classify
-		// files vs directories (and read size/mtime) without re-statting each.
+		// Carry the metadata the glob already returned so DuckDB can read
+		// size/mtime without re-statting each file.
 		info.extended_info = MakeExtendedInfo(entries[i]);
 		result.push_back(std::move(info));
 	}

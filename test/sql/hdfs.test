@@ -61,6 +61,14 @@ SELECT count(*) FROM glob('hdfs://localhost:9000/test/*.parquet');
 ----
 1
 
+# A bare '*' matches the two top-level files plus the nested/ directory, but
+# directories are filtered out of glob results (so readers never try to open a
+# directory as a data file). Run before any writes so the count is stable.
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/test/*');
+----
+2
+
 # Reading a glob pattern directly expands to the matching files.
 query I
 SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data*.csv');
