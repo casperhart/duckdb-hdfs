@@ -25,6 +25,10 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
   (move).
 - Concurrent positional reads (DuckDB's parallel Parquet reader) on a single
   handle.
+- Reading and writing data in HDFS encryption zones (Transparent Data
+  Encryption): the KMS is contacted over TLS to unwrap the key, and data is
+  decrypted/encrypted client-side. Requires the Hadoop key provider to be
+  configured (`hadoop.security.key.provider.path` / `dfs.encryption.key.provider.uri`).
 
 ## URL / authority handling
 
