@@ -5,6 +5,7 @@
 #include "duckdb.hpp"
 
 #include "hdfs_filesystem.hpp"
+#include "hdfs_functions.hpp"
 
 namespace duckdb {
 
@@ -14,7 +15,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// standard Hadoop environment (HADOOP_CONF_DIR / HADOOP_HOME, HADOOP_USER_NAME
 	// / keytab / current account), so there are no extension settings to register.
 	auto &fs = loader.GetDatabaseInstance().GetFileSystem();
-	fs.RegisterSubSystem(make_uniq<HdfsFileSystem>());
+	auto hdfs_fs = make_uniq<HdfsFileSystem>();
+	// Borrowed by the metadata SQL functions below; the VirtualFileSystem owns it
+	// for the database's lifetime, so the raw pointer stays valid.
+	auto *hdfs_ptr = hdfs_fs.get();
+	fs.RegisterSubSystem(std::move(hdfs_fs));
+
+	// Register the HDFS metadata functions (hdfs_ls / hdfs_glob / hdfs_stat /
+	// hdfs_exists).
+	RegisterHdfsFunctions(loader, hdfs_ptr);
 }
 
 void HdfsExtension::Load(ExtensionLoader &loader) {

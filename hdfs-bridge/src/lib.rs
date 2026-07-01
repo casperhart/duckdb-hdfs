@@ -63,13 +63,21 @@ pub struct FileInfo {
 }
 
 /// One entry in a directory listing or glob result, mirrored in
-/// `hdfs_bridge.h`. `path` is an owned C string.
+/// `hdfs_bridge.h`. `path`, `owner` and `group` are owned C strings.
+/// `replication` and `block_size` use `-1` to mean "not applicable" (HDFS
+/// leaves them unset for directories).
 #[repr(C)]
 pub struct DirEntry {
     pub path: *mut c_char,
     pub is_dir: bool,
     pub length: i64,
     pub mtime: u64,
+    pub atime: u64,
+    pub owner: *mut c_char,
+    pub group: *mut c_char,
+    pub permission: u16,
+    pub replication: i32,
+    pub block_size: i64,
 }
 
 // --- error helpers ---------------------------------------------------------
@@ -380,6 +388,43 @@ pub unsafe extern "C" fn hdfs_bridge_close_writer(
 
 // --- directory operations --------------------------------------------------
 
+/// Build an owned C string, falling back to an empty string on the (impossible
+/// for HDFS) interior-NUL case rather than panicking across the FFI boundary.
+fn to_c_string(s: String) -> *mut c_char {
+    CString::new(s)
+        .unwrap_or_else(|_| CString::new("").unwrap())
+        .into_raw()
+}
+
+/// Convert a single `FileStatus` into an owned `DirEntry`. Callers must free the
+/// entry's strings (`path`/`owner`/`group`) via `hdfs_bridge_free_dir_entries`.
+fn status_to_entry(status: hdfs_native::client::FileStatus) -> DirEntry {
+    DirEntry {
+        path: to_c_string(status.path),
+        is_dir: status.isdir,
+        length: status.length as i64,
+        mtime: status.modification_time,
+        atime: status.access_time,
+        owner: to_c_string(status.owner),
+        group: to_c_string(status.group),
+        permission: status.permission,
+        // Replication and block size apply only to files; `-1` signals "not
+        // applicable" so the C++ side surfaces SQL NULL. The NameNode reports 0
+        // (not absent) for directories, so gate on `isdir` rather than the
+        // Option being None.
+        replication: if status.isdir {
+            -1
+        } else {
+            status.replication.map(|r| r as i32).unwrap_or(-1)
+        },
+        block_size: if status.isdir {
+            -1
+        } else {
+            status.blocksize.map(|b| b as i64).unwrap_or(-1)
+        },
+    }
+}
+
 /// Build a heap array of `DirEntry` from file statuses and hand ownership to
 /// the caller. Returns null and sets `*out_count = 0` for an empty list.
 fn statuses_to_entries(
@@ -391,18 +436,7 @@ fn statuses_to_entries(
     if count == 0 {
         return ptr::null_mut();
     }
-    let mut entries: Vec<DirEntry> = Vec::with_capacity(count);
-    for status in statuses {
-        // path comes back scheme-less ("/a/b"); interior NULs are impossible
-        // in HDFS paths, but guard anyway.
-        let c_path = CString::new(status.path).unwrap_or_else(|_| CString::new("").unwrap());
-        entries.push(DirEntry {
-            path: c_path.into_raw(),
-            is_dir: status.isdir,
-            length: status.length as i64,
-            mtime: status.modification_time,
-        });
-    }
+    let entries: Vec<DirEntry> = statuses.into_iter().map(status_to_entry).collect();
     let boxed = entries.into_boxed_slice();
     Box::into_raw(boxed) as *mut DirEntry
 }
@@ -430,18 +464,20 @@ pub unsafe extern "C" fn hdfs_bridge_glob(
     }
 }
 
-/// List the immediate children of directory `path` (non-recursive). A null
-/// return with `status->code == HDFS_OK` means an empty directory.
+/// List the children of directory `path`. When `recursive` is true the whole
+/// subtree is walked. A null return with `status->code == HDFS_OK` means an
+/// empty directory.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_list_status(
     client: *mut Client,
     path: *const c_char,
+    recursive: bool,
     out_count: *mut i32,
     status: *mut Status,
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.list_status(&path, false) {
+    match client.list_status(&path, recursive) {
         Ok(statuses) => statuses_to_entries(statuses, out_count),
         Err(e) => {
             unsafe {
@@ -461,8 +497,34 @@ pub unsafe extern "C" fn hdfs_bridge_free_dir_entries(entries: *mut DirEntry, co
     }
     let slice = unsafe { Box::from_raw(slice::from_raw_parts_mut(entries, count as usize)) };
     for entry in slice.iter() {
-        if !entry.path.is_null() {
-            unsafe { drop(CString::from_raw(entry.path)) };
+        for s in [entry.path, entry.owner, entry.group] {
+            if !s.is_null() {
+                unsafe { drop(CString::from_raw(s)) };
+            }
+        }
+    }
+}
+
+/// Stat a single `path`, returning a one-element `DirEntry` array (freed with
+/// `hdfs_bridge_free_dir_entries(ptr, 1)`). Returns null on error (including
+/// not-found; check `status->code`). This is the rich counterpart to
+/// `hdfs_bridge_get_file_info`, which stays lean for the internal hot path.
+#[no_mangle]
+pub unsafe extern "C" fn hdfs_bridge_stat(
+    client: *mut Client,
+    path: *const c_char,
+    status: *mut Status,
+) -> *mut DirEntry {
+    let client = unsafe { &*client };
+    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+    match client.get_file_info(&path) {
+        Ok(info) => {
+            let boxed = vec![status_to_entry(info)].into_boxed_slice();
+            Box::into_raw(boxed) as *mut DirEntry
+        }
+        Err(e) => {
+            unsafe { set_error(status, format_args!("stat '{path}' failed"), &e) };
+            ptr::null_mut()
         }
     }
 }

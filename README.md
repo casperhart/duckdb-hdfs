@@ -30,6 +30,58 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
   decrypted/encrypted client-side. Requires the Hadoop key provider to be
   configured (`hadoop.security.key.provider.path` / `dfs.encryption.key.provider.uri`).
 
+## Querying HDFS metadata
+
+Besides reading and writing file *contents*, the extension exposes HDFS
+*metadata* as SQL. These return full `FileStatus` metadata — type, size, owner,
+group, permissions, replication, block size, and modification/access times — and,
+unlike DuckDB's built-in `glob()`, they include directories.
+
+```sql
+-- List a directory's immediate children (directories included).
+SELECT name, type, size, owner, permissions
+FROM hdfs_ls('hdfs://namenode:8020/data');
+
+-- Walk the whole subtree.
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/data', recursive := true);
+
+-- Filter with SQL rather than a shell glob (replaces `hdfs dfs -ls -d .../temp_*`).
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/data')
+WHERE starts_with(name, 'temp_');
+
+-- Expand a wildcard pattern across the tree (directories kept).
+SELECT * FROM hdfs_glob('hdfs://namenode:8020/data/year=*/month=*/*.parquet');
+
+-- Metadata for one path (file or directory), as a single row.
+SELECT * FROM hdfs_stat('hdfs://namenode:8020/data');
+
+-- Existence check (scalar boolean).
+SELECT hdfs_exists('hdfs://namenode:8020/data/events');
+```
+
+Columns for `hdfs_ls` / `hdfs_glob` / `hdfs_stat` (identical, so results
+compose/`UNION`): `path` (full `hdfs://` URL), `name` (basename), `type`
+(`'file'`/`'directory'`), `size`, `owner`, `group`, `permissions` (symbolic
+`rwxr-xr-x`), `mode` (raw permission bits), `replication`, `block_size` (both
+`NULL` for directories), `last_modified`, `last_accessed`.
+
+**`hdfs_ls` vs `hdfs_glob`.** `hdfs_ls` takes a *literal* directory path
+(`getListing`) and returns its children, showing subdirectories as rows without
+descending into them. `hdfs_glob` takes a *pattern* and returns the matched
+entries as-is. A wildcard passed to `hdfs_ls` is matched literally (and errors
+with a hint to use `hdfs_glob`).
+
+**Keeping it fast.** HDFS has no server-side glob RPC, so `hdfs_glob` expands
+wildcards client-side by walking the tree with one `getListing` per matching
+directory — cost scales with the pattern's fan-out. Prefer an anchored literal
+prefix (`/data/2024/*` over `/*/*/*`), keep wildcards shallow, and for
+single-directory filtering use `hdfs_ls(dir) WHERE …` (one RPC) rather than a
+glob. Requesting the full metadata columns adds **no** extra RPCs — HDFS already
+returns them in the same listing call.
+
+These functions are read-only (metadata queries); the extension does not expose
+SQL functions that mutate the filesystem.
+
 ## URL / authority handling
 
 Paths are `hdfs://<host>:<port>/<path>`. The `host:port` authority selects the

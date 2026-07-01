@@ -13,7 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp)
+set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp)
 
 # Build the Rust FFI bridge (hdfs-bridge) via Corrosion. Corrosion integrates
 # cargo into the cmake build and, crucially for CI, honours -DRust_CARGO_TARGET

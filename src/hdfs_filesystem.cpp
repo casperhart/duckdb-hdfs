@@ -62,6 +62,30 @@ string MakeUrl(const string &authority, const string &hdfs_path) {
 	return prefix + hdfs_path;
 }
 
+// Map a bridge directory entry (scheme-less full path) to a rich HdfsEntry,
+// reattaching `authority` to build the URL and splitting off the basename.
+HdfsEntry MakeHdfsEntry(const string &authority, const hdfs_dir_entry_t &entry) {
+	string full = entry.path ? string(entry.path) : string();
+	string name = full;
+	size_t slash = full.find_last_of('/');
+	if (slash != string::npos) {
+		name = full.substr(slash + 1);
+	}
+	HdfsEntry out;
+	out.url = MakeUrl(authority, full);
+	out.name = std::move(name);
+	out.is_dir = entry.is_dir;
+	out.size = entry.length;
+	out.owner = entry.owner ? string(entry.owner) : string();
+	out.group = entry.group ? string(entry.group) : string();
+	out.permission = entry.permission;
+	out.replication = entry.replication;
+	out.block_size = entry.block_size;
+	out.mtime = entry.mtime;
+	out.atime = entry.atime;
+	return out;
+}
+
 } // namespace
 
 // RAII owner for an `hdfs_status_t` produced by the Rust bridge. Pass `&status`
@@ -443,7 +467,7 @@ bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::funct
 	hdfs_dir_entry_t *entries = nullptr;
 	BridgeStatus status;
 	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), &count, st);
+		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), /*recursive=*/false, &count, st);
 		// A null result with an OK status is an empty directory, not a failure;
 		// the status code is the sole success signal.
 		return st->code == HDFS_OK;
@@ -506,6 +530,107 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 		hdfs_bridge_free_dir_entries(entries, count);
 	}
 	return result;
+}
+
+vector<HdfsEntry> HdfsFileSystem::ListStatus(const string &url, bool recursive) {
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(url, authority, hdfs_path);
+
+	int32_t count = 0;
+	hdfs_dir_entry_t *entries = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), recursive, &count, st);
+		// A null result with an OK status is an empty directory, not a failure.
+		return st->code == HDFS_OK;
+	});
+	if (!status.Ok()) {
+		// hdfs_ls treats its argument literally; a wildcard here won't expand.
+		// Point the user at hdfs_glob rather than a bare "not found".
+		if (status.IsNotFound() && hdfs_path.find_first_of("*?[{") != string::npos) {
+			throw IOException("hdfs_ls path '%s' looks like a glob pattern but is matched literally; "
+			                  "use hdfs_glob() for wildcard patterns",
+			                  url);
+		}
+		throw IOException("Failed to list HDFS path '%s': %s", url, status.Message());
+	}
+	vector<HdfsEntry> result;
+	result.reserve(count);
+	for (int32_t i = 0; i < count; i++) {
+		result.push_back(MakeHdfsEntry(authority, entries[i]));
+	}
+	if (entries) {
+		hdfs_bridge_free_dir_entries(entries, count);
+	}
+	return result;
+}
+
+vector<HdfsEntry> HdfsFileSystem::GlobStatus(const string &pattern) {
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(pattern, authority, hdfs_path);
+
+	int32_t count = 0;
+	hdfs_dir_entry_t *entries = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		entries = hdfs_bridge_glob(client, hdfs_path.c_str(), &count, st);
+		// Null + OK means "no matches"; only a non-OK status is an error.
+		return st->code == HDFS_OK;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to glob HDFS path '%s': %s", pattern, status.Message());
+	}
+	vector<HdfsEntry> result;
+	result.reserve(count);
+	// Unlike Glob(), keep directory matches: the metadata functions surface them
+	// as rows rather than feeding a multi-file reader.
+	for (int32_t i = 0; i < count; i++) {
+		result.push_back(MakeHdfsEntry(authority, entries[i]));
+	}
+	if (entries) {
+		hdfs_bridge_free_dir_entries(entries, count);
+	}
+	return result;
+}
+
+HdfsEntry HdfsFileSystem::Stat(const string &url) {
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(url, authority, hdfs_path);
+
+	hdfs_dir_entry_t *entry = nullptr;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		entry = hdfs_bridge_stat(client, hdfs_path.c_str(), st);
+		return st->code == HDFS_OK;
+	});
+	if (!status.Ok()) {
+		throw IOException("Failed to stat HDFS path '%s': %s", url, status.Message());
+	}
+	HdfsEntry result = MakeHdfsEntry(authority, *entry);
+	hdfs_bridge_free_dir_entries(entry, 1);
+	return result;
+}
+
+bool HdfsFileSystem::Exists(const string &url) {
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(url, authority, hdfs_path);
+	hdfs_file_info_t info;
+	BridgeStatus status;
+	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	});
+	if (status.Ok()) {
+		return true;
+	}
+	if (status.IsNotFound()) {
+		return false;
+	}
+	// A connection/permission error is not the same as "does not exist".
+	throw IOException("Failed to check HDFS path '%s': %s", url, status.Message());
 }
 
 bool HdfsFileSystem::CanHandleFile(const string &fpath) {

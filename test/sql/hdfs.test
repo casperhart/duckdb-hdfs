@@ -76,6 +76,99 @@ SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data*.csv');
 ----
 3
 
+# --- metadata functions: hdfs_ls / hdfs_glob / hdfs_stat / hdfs_exists --------
+# Run before any writes so /test holds exactly data.csv, data.parquet, nested/
+# (and nested/ holds more.parquet).
+
+# hdfs_ls lists a directory's immediate children, directories included (unlike
+# glob(), which drops them).
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/test') ORDER BY name;
+----
+data.csv	file
+data.parquet	file
+nested	directory
+
+# The path column carries the authority back as a full hdfs:// URL.
+query T
+SELECT path FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'nested';
+----
+hdfs://localhost:9000/test/nested
+
+# Full metadata is populated: owner non-empty and permissions are 9 chars.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test')
+WHERE length(owner) > 0 AND length(permissions) = 9;
+----
+3
+
+# Files carry replication / block_size; directories report them as NULL.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test')
+WHERE name = 'data.csv' AND replication >= 1 AND block_size > 0;
+----
+1
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test')
+WHERE name = 'nested' AND replication IS NULL AND block_size IS NULL;
+----
+1
+
+# recursive descends the subtree (nested/ holds more.parquet at this point) and
+# yields the nested directory entry itself too.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test', recursive := true);
+----
+4
+
+# A wildcard passed to hdfs_ls is matched literally -> a helpful error pointing
+# at hdfs_glob, not a bare "not found".
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/*');
+----
+use hdfs_glob()
+
+# hdfs_glob expands wildcards and keeps directory matches.
+query TT
+SELECT name, type FROM hdfs_glob('hdfs://localhost:9000/test/*') ORDER BY name;
+----
+data.csv	file
+data.parquet	file
+nested	directory
+
+# hdfs_stat returns exactly one row for a single path, file or directory.
+query TT
+SELECT name, type FROM hdfs_stat('hdfs://localhost:9000/test/nested');
+----
+nested	directory
+
+query TT
+SELECT name, type FROM hdfs_stat('hdfs://localhost:9000/test/data.parquet');
+----
+data.parquet	file
+
+# Stat on a missing path errors.
+statement error
+SELECT * FROM hdfs_stat('hdfs://localhost:9000/test/does_not_exist');
+----
+
+# hdfs_exists is a scalar boolean predicate (true for files and directories).
+query I
+SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/data.csv');
+----
+1
+
+query I
+SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/nested');
+----
+1
+
+query I
+SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/does_not_exist');
+----
+0
+
 # --- writing (COPY TO) then reading back -------------------------------------
 # Writes go under nested/ so they can't perturb the /test/*.{csv,parquet} globs.
 

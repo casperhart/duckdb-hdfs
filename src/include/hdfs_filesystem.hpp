@@ -13,6 +13,25 @@ namespace duckdb {
 struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
 class HdfsConnection; // A reconnectable, lazily-established client for one authority.
 
+// A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
+// hdfs_glob / hdfs_stat table functions. `url` carries the authority back
+// (e.g. "hdfs://host:port/a/b"); `name` is the basename. `replication` and
+// `block_size` are -1 when not applicable (HDFS leaves them unset for
+// directories); `mtime`/`atime` are epoch milliseconds.
+struct HdfsEntry {
+	string url;
+	string name;
+	bool is_dir = false;
+	int64_t size = 0;
+	string owner;
+	string group;
+	uint16_t permission = 0;
+	int32_t replication = -1;
+	int64_t block_size = -1;
+	uint64_t mtime = 0;
+	uint64_t atime = 0;
+};
+
 struct HdfsFileHandle : public FileHandle {
 	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, hdfs_reader_t *reader, hdfs_writer_t *writer)
 	    : FileHandle(fs, std::move(path), flags), reader(reader), writer(writer) {
@@ -75,6 +94,20 @@ public:
 	void FileSync(FileHandle &handle) override {
 	}
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
+
+	// Rich-metadata accessors backing the SQL metadata functions. Unlike Glob()
+	// (which drops directories and exposes only type/size/mtime), these carry the
+	// full FileStatus and keep directory entries.
+	//
+	// ListStatus: immediate children of `url` (or the whole subtree when
+	//   recursive); a file path yields that single entry.
+	// GlobStatus: entries matching a wildcard `pattern`, directories included.
+	// Stat:       metadata for a single `url` (file or directory).
+	vector<HdfsEntry> ListStatus(const string &url, bool recursive);
+	vector<HdfsEntry> GlobStatus(const string &pattern);
+	HdfsEntry Stat(const string &url);
+	// True if `url` exists (file or directory); a single stat RPC.
+	bool Exists(const string &url);
 
 	bool CanHandleFile(const string &fpath) override;
 	std::string GetName() const override {

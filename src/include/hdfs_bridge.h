@@ -44,13 +44,21 @@ typedef struct {
 	uint64_t mtime;
 } hdfs_file_info_t;
 
-// One entry in a listing/glob result. `path` is an owned C string (scheme-less,
-// e.g. "/a/b"). Mirrors `DirEntry` in lib.rs.
+// One entry in a listing/glob result. `path`, `owner` and `group` are owned C
+// strings (`path` is scheme-less, e.g. "/a/b"). `replication` and `block_size`
+// are `-1` when not applicable (HDFS leaves them unset for directories).
+// Mirrors `DirEntry` in lib.rs.
 typedef struct {
 	char *path;
 	bool is_dir;
 	int64_t length;
 	uint64_t mtime;
+	uint64_t atime;
+	char *owner;
+	char *group;
+	uint16_t permission;
+	int32_t replication;
+	int64_t block_size;
 } hdfs_dir_entry_t;
 
 // Free a heap string owned by the caller (an `hdfs_status_t::msg`, etc.).
@@ -63,6 +71,10 @@ void hdfs_bridge_free_client(hdfs_client_t *client);
 // Metadata. Returns 0 on success, -1 on failure (see `status` for the category).
 int32_t hdfs_bridge_get_file_info(hdfs_client_t *client, const char *path, hdfs_file_info_t *out,
                                   hdfs_status_t *status);
+
+// Rich single-path stat: returns a one-element array (free with
+// hdfs_bridge_free_dir_entries(ptr, 1)), or NULL on failure (see `status`).
+hdfs_dir_entry_t *hdfs_bridge_stat(hdfs_client_t *client, const char *path, hdfs_status_t *status);
 
 // Reading.
 hdfs_reader_t *hdfs_bridge_open(hdfs_client_t *client, const char *path, hdfs_status_t *status);
@@ -82,7 +94,7 @@ int32_t hdfs_bridge_close_writer(hdfs_writer_t *writer, hdfs_status_t *status);
 // A NULL return with `status->code == HDFS_OK` means an empty result (not an error).
 hdfs_dir_entry_t *hdfs_bridge_glob(hdfs_client_t *client, const char *pattern, int32_t *out_count,
                                    hdfs_status_t *status);
-hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path, int32_t *out_count,
+hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path, bool recursive, int32_t *out_count,
                                           hdfs_status_t *status);
 void hdfs_bridge_free_dir_entries(hdfs_dir_entry_t *entries, int32_t count);
 
