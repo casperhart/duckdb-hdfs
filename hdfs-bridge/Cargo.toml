@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["staticlib"]
+# rlib in addition to staticlib so benches can link the crate.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 hdfs-native = { git = "https://github.com/casperhart/hdfs-native", branch = "kms", features = ["kms-rustls-tls"] }
@@ -15,3 +16,12 @@ libc = "0.2"
 bytes = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+# The latency-proxy benchmark needs socket + timer support on top of the
+# features the library itself uses.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
+
+[[bench]]
+name = "list_partitions"
+harness = false
