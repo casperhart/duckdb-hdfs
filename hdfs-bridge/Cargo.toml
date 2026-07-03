@@ -9,3 +9,9 @@ crate-type = ["staticlib"]
 [dependencies]
 hdfs-native = { git = "https://github.com/casperhart/hdfs-native", branch = "kms", features = ["kms-rustls-tls"] }
 libc = "0.2"
+# The bridge drives hdfs-native's async client directly (the sync wrapper hides
+# its runtime, which the parallel recursive listing needs). These are all
+# already in hdfs-native's dependency tree.
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

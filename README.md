@@ -90,9 +90,20 @@ your Hadoop config (`fs.defaultFS`).
 
 ## Configuration
 
-There are no extension-specific settings — connection config is resolved by
-`hdfs-native` from the standard Hadoop environment, exactly as the Hadoop CLI
-tools do:
+### Extension settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by recursive listings (`hdfs_ls(..., recursive := true)`). Listings stream: rows are produced while the tree walk is still in flight, and recursive results arrive in completion order (no ordering guarantee — use `ORDER BY` if order matters). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
+
+```sql
+SET hdfs_list_parallelism = 64;
+```
+
+### Connection configuration
+
+Connection config is resolved by `hdfs-native` from the standard Hadoop
+environment, exactly as the Hadoop CLI tools do:
 
 - **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`, or
   failing that `HADOOP_HOME/etc/hadoop`.

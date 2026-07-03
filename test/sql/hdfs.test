@@ -122,6 +122,39 @@ SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test', recursive := true);
 ----
 4
 
+# hdfs_list_parallelism bounds the concurrent listing RPCs of a recursive
+# listing, which streams entries as the background walk produces them. Row
+# order is completion order (not guaranteed), so always ORDER BY here.
+query T
+SELECT current_setting('hdfs_list_parallelism');
+----
+16
+
+statement ok
+SET hdfs_list_parallelism = 1;
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/test', recursive := true) ORDER BY name;
+----
+data.csv
+data.parquet
+more.parquet
+nested
+
+statement ok
+SET hdfs_list_parallelism = 64;
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/test', recursive := true) ORDER BY name;
+----
+data.csv
+data.parquet
+more.parquet
+nested
+
+statement ok
+RESET hdfs_list_parallelism;
+
 # A wildcard passed to hdfs_ls is matched literally -> a helpful error pointing
 # at hdfs_glob, not a bare "not found".
 statement error

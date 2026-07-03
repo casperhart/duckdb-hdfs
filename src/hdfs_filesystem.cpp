@@ -532,20 +532,47 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 	return result;
 }
 
-vector<HdfsEntry> HdfsFileSystem::ListStatus(const string &url, bool recursive) {
-	string authority;
-	string hdfs_path;
-	ParseHdfsPath(url, authority, hdfs_path);
+HdfsListStream::~HdfsListStream() {
+	if (handle) {
+		hdfs_bridge_list_stream_free(handle);
+	}
+}
 
-	int32_t count = 0;
-	hdfs_dir_entry_t *entries = nullptr;
-	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), recursive, &count, st);
-		// A null result with an OK status is an empty directory, not a failure.
-		return st->code == HDFS_OK;
-	});
-	if (!status.Ok()) {
+void HdfsListStream::Open() {
+	client = conn->Get(); // throws on connect failure
+	handle = hdfs_bridge_list_stream_open(client.get(), hdfs_path.c_str(), recursive, max_parallelism);
+}
+
+bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries) {
+	out.clear();
+	for (;;) {
+		int32_t count = 0;
+		BridgeStatus status;
+		hdfs_dir_entry_t *entries =
+		    hdfs_bridge_list_stream_next(handle, static_cast<int32_t>(max_entries), &count, &status);
+		if (status.Ok()) {
+			out.reserve(count);
+			for (int32_t i = 0; i < count; i++) {
+				out.push_back(MakeHdfsEntry(authority, entries[i]));
+			}
+			if (entries) {
+				hdfs_bridge_free_dir_entries(entries, count);
+			}
+			emitted_any |= count > 0;
+			return count > 0; // 0 with an OK status means the walk completed
+		}
+		// Mirror Execute()'s retry-once semantics for a stale connection
+		// (NameNode failover, dropped socket, expired ticket). Only transparent
+		// while nothing has been handed out yet: the walk restarts from the
+		// root, so retrying later would duplicate entries.
+		if (status.IsConnection() && !emitted_any && !retried) {
+			retried = true;
+			hdfs_bridge_list_stream_free(handle);
+			handle = nullptr;
+			conn->Invalidate(client);
+			Open();
+			continue;
+		}
 		// hdfs_ls treats its argument literally; a wildcard here won't expand.
 		// Point the user at hdfs_glob rather than a bare "not found".
 		if (status.IsNotFound() && hdfs_path.find_first_of("*?[{") != string::npos) {
@@ -555,15 +582,18 @@ vector<HdfsEntry> HdfsFileSystem::ListStatus(const string &url, bool recursive) 
 		}
 		throw IOException("Failed to list HDFS path '%s': %s", url, status.Message());
 	}
-	vector<HdfsEntry> result;
-	result.reserve(count);
-	for (int32_t i = 0; i < count; i++) {
-		result.push_back(MakeHdfsEntry(authority, entries[i]));
-	}
-	if (entries) {
-		hdfs_bridge_free_dir_entries(entries, count);
-	}
-	return result;
+}
+
+unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, bool recursive, int32_t max_parallelism) {
+	// Not make_uniq: the constructor is private to keep construction here.
+	auto stream = unique_ptr<HdfsListStream>(new HdfsListStream());
+	stream->url = url;
+	ParseHdfsPath(url, stream->authority, stream->hdfs_path);
+	stream->recursive = recursive;
+	stream->max_parallelism = max_parallelism;
+	stream->conn = &GetConnection(stream->authority);
+	stream->Open();
+	return stream;
 }
 
 vector<HdfsEntry> HdfsFileSystem::GlobStatus(const string &pattern) {

@@ -11,6 +11,7 @@ extern "C" {
 typedef struct hdfs_client hdfs_client_t;
 typedef struct hdfs_reader hdfs_reader_t;
 typedef struct hdfs_writer hdfs_writer_t;
+typedef struct hdfs_list_stream hdfs_list_stream_t;
 
 // Error categories carried across the FFI boundary. The bridge classifies the
 // underlying `hdfs_native::HdfsError` into one of these so the C++ side can act
@@ -97,6 +98,23 @@ hdfs_dir_entry_t *hdfs_bridge_glob(hdfs_client_t *client, const char *pattern, i
 hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path, bool recursive, int32_t *out_count,
                                           hdfs_status_t *status);
 void hdfs_bridge_free_dir_entries(hdfs_dir_entry_t *entries, int32_t count);
+
+// Streaming listing: a background walk feeds entries through a bounded buffer,
+// so results flow before the (possibly huge) tree is fully listed. When
+// `recursive`, up to `max_parallelism` listing RPCs run concurrently (<= 1
+// lists one directory at a time) and entries arrive in completion order, not
+// DFS order. Opening never fails; errors (including not-found) surface on the
+// first _next call. Streams are not thread-safe: drive each from one thread at
+// a time, and free with hdfs_bridge_list_stream_free (which also cancels an
+// unfinished walk).
+hdfs_list_stream_t *hdfs_bridge_list_stream_open(hdfs_client_t *client, const char *path, bool recursive,
+                                                 int32_t max_parallelism);
+// Blocks until at least one entry is available; returns a batch of at most
+// `max_entries` (freed with hdfs_bridge_free_dir_entries). NULL with an OK
+// status means the listing is exhausted; NULL with a non-OK status is an error.
+hdfs_dir_entry_t *hdfs_bridge_list_stream_next(hdfs_list_stream_t *stream, int32_t max_entries, int32_t *out_count,
+                                               hdfs_status_t *status);
+void hdfs_bridge_list_stream_free(hdfs_list_stream_t *stream);
 
 // Mutations.
 int32_t hdfs_bridge_mkdirs(hdfs_client_t *client, const char *path, hdfs_status_t *status);

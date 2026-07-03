@@ -12,6 +12,7 @@ namespace duckdb {
 // Implementation details defined in hdfs_filesystem.cpp.
 struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
 class HdfsConnection; // A reconnectable, lazily-established client for one authority.
+class HdfsFileSystem;
 
 // A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
 // hdfs_glob / hdfs_stat table functions. `url` carries the authority back
@@ -54,6 +55,43 @@ struct HdfsFileHandle : public FileHandle {
 	idx_t position = 0;
 	// Cached length for readers; bytes written so far for writers.
 	idx_t length = 0;
+};
+
+// A streaming directory listing backing hdfs_ls: a background walk in the
+// bridge produces entries while Next() hands them out in batches, so rows
+// flow before a large tree is fully listed. Recursive listings fan out up to
+// `max_parallelism` concurrent listing RPCs and deliver entries in completion
+// order (no global ordering guarantee). Not thread-safe: drive from one
+// thread at a time. Created via HdfsFileSystem::OpenListStream().
+class HdfsListStream {
+public:
+	~HdfsListStream();
+	HdfsListStream(const HdfsListStream &) = delete;
+	HdfsListStream &operator=(const HdfsListStream &) = delete;
+
+	// Replace `out` with the next batch (at most max_entries), blocking until
+	// at least one entry arrives. Returns false when the listing is exhausted
+	// (`out` left empty). Throws on listing errors; a connection-level failure
+	// is transparently retried once, but only while no entries have been
+	// handed out yet (afterwards a restart would duplicate them).
+	bool Next(vector<HdfsEntry> &out, idx_t max_entries);
+
+private:
+	friend class HdfsFileSystem;
+	HdfsListStream() = default;
+	// (Re)establish the client and open the bridge stream.
+	void Open();
+
+	string url;       // original URL, for error messages
+	string authority; // "hdfs://host:port", or "" for the default FS
+	string hdfs_path; // scheme-less path
+	bool recursive = false;
+	int32_t max_parallelism = 1;
+	HdfsConnection *conn = nullptr; // owned by the filesystem, which outlives us
+	std::shared_ptr<hdfs_client_t> client;
+	hdfs_list_stream_t *handle = nullptr;
+	bool emitted_any = false;
+	bool retried = false;
 };
 
 class HdfsFileSystem : public FileSystem {
@@ -99,11 +137,13 @@ public:
 	// (which drops directories and exposes only type/size/mtime), these carry the
 	// full FileStatus and keep directory entries.
 	//
-	// ListStatus: immediate children of `url` (or the whole subtree when
-	//   recursive); a file path yields that single entry.
+	// OpenListStream: streaming listing of `url`'s immediate children (or the
+	//   whole subtree when recursive); a file path yields that single entry.
+	//   For recursive listings, `max_parallelism > 1` bounds the number of
+	//   concurrent listing RPCs (the hdfs_list_parallelism setting).
 	// GlobStatus: entries matching a wildcard `pattern`, directories included.
 	// Stat:       metadata for a single `url` (file or directory).
-	vector<HdfsEntry> ListStatus(const string &url, bool recursive);
+	unique_ptr<HdfsListStream> OpenListStream(const string &url, bool recursive, int32_t max_parallelism = 1);
 	vector<HdfsEntry> GlobStatus(const string &pattern);
 	HdfsEntry Stat(const string &url);
 	// True if `url` exists (file or directory); a single stat RPC.

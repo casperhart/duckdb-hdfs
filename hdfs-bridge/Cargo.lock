@@ -521,8 +521,11 @@ dependencies = [
 name = "hdfs-bridge"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures",
  "hdfs-native",
  "libc",
+ "tokio",
 ]
 
 [[package]]

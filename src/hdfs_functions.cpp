@@ -2,6 +2,7 @@
 
 #include "hdfs_filesystem.hpp"
 
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -92,8 +93,10 @@ unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindI
 	return std::move(result);
 }
 
-// Runs the RPC once and holds the resulting rows for streaming out.
+// LIST streams batches from a background walk as they arrive; GLOB and STAT
+// run their RPC once in Init and hold the resulting rows.
 struct HdfsMetaGlobalState : public GlobalTableFunctionState {
+	unique_ptr<HdfsListStream> stream;
 	vector<HdfsEntry> entries;
 	idx_t offset = 0;
 };
@@ -102,9 +105,19 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
 	auto state = make_uniq<HdfsMetaGlobalState>();
 	switch (bind_data.op) {
-	case HdfsMetaOp::LIST:
-		state->entries = bind_data.hdfs->ListStatus(bind_data.path, bind_data.recursive);
+	case HdfsMetaOp::LIST: {
+		// hdfs_list_parallelism (registered at extension load) bounds the number
+		// of concurrent listing RPCs of a recursive walk; it has no effect on
+		// non-recursive listings. Capped at INT32_MAX for the FFI signature.
+		int32_t max_parallelism = 1;
+		Value setting;
+		if (context.TryGetCurrentSetting("hdfs_list_parallelism", setting)) {
+			max_parallelism = static_cast<int32_t>(
+			    MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+		}
+		state->stream = bind_data.hdfs->OpenListStream(bind_data.path, bind_data.recursive, max_parallelism);
 		break;
+	}
 	case HdfsMetaOp::GLOB:
 		state->entries = bind_data.hdfs->GlobStatus(bind_data.path);
 		break;
@@ -117,7 +130,20 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 
 void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<HdfsMetaGlobalState>();
-	idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.entries.size() - state.offset);
+	// LIST pulls the next batch from the background walk (blocking until rows
+	// arrive or the walk ends); GLOB/STAT emit a slice of the materialized rows.
+	vector<HdfsEntry> batch;
+	const HdfsEntry *rows;
+	idx_t count;
+	if (state.stream) {
+		state.stream->Next(batch, STANDARD_VECTOR_SIZE);
+		rows = batch.data();
+		count = batch.size();
+	} else {
+		count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.entries.size() - state.offset);
+		rows = state.entries.data() + state.offset;
+		state.offset += count;
+	}
 
 	auto path_data = FlatVector::GetData<string_t>(output.data[COL_PATH]);
 	auto name_data = FlatVector::GetData<string_t>(output.data[COL_NAME]);
@@ -133,7 +159,7 @@ void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChu
 	auto atime_data = FlatVector::GetData<timestamp_t>(output.data[COL_LAST_ACCESSED]);
 
 	for (idx_t i = 0; i < count; i++) {
-		auto &entry = state.entries[state.offset + i];
+		const auto &entry = rows[i];
 		path_data[i] = StringVector::AddString(output.data[COL_PATH], entry.url);
 		name_data[i] = StringVector::AddString(output.data[COL_NAME], entry.name);
 		type_data[i] = StringVector::AddString(output.data[COL_TYPE], entry.is_dir ? "directory" : "file");
@@ -158,7 +184,6 @@ void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChu
 		mtime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime));
 		atime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.atime));
 	}
-	state.offset += count;
 	output.SetCardinality(count);
 }
 
