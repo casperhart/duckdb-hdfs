@@ -6,21 +6,6 @@ on cluster nodes where `HADOOP_CONF_DIR` / `HADOOP_USER_NAME` are already set
 for Hive/Spark/the HDFS CLI, so it "just works" — no DuckDB secrets
 integration.
 
-## 1. Make the file-handle → client lifetime explicit
-
-An `HdfsFileHandle` holds a raw `hdfs_reader_t*` but not the
-`shared_ptr<hdfs_client_t>` it was created from. If a connection-level retry
-invalidates the client while a read handle is still open, the client can be
-freed out from under the reader. This is safe *today* because hdfs-native's
-`FileReader` is self-contained after open (it has its block locations and
-talks to DataNodes directly; it never goes back through the `Client`) — a
-fact that is invisible from the C++ side, and an upstream hdfs-native change
-(e.g. a `FileReader` that lazily re-fetches block locations through the
-client) would break it silently. Fix: store the `shared_ptr<hdfs_client_t>` in
-`HdfsFileHandle` so the handle keeps its client alive — one refcount, makes
-ownership self-evident. At minimum, document the invariant next to the
-existing `Send`/`Sync` static asserts in `client.rs`.
-
 ## Smaller items
 
 - **Failover retry is single-shot and immediate** *(not yet discussed —

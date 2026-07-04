@@ -38,8 +38,9 @@ struct HdfsEntry {
 };
 
 struct HdfsFileHandle : public FileHandle {
-	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, hdfs_reader_t *reader, hdfs_writer_t *writer)
-	    : FileHandle(fs, std::move(path), flags), reader(reader), writer(writer) {
+	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, std::shared_ptr<hdfs_client_t> client,
+	               hdfs_reader_t *reader, hdfs_writer_t *writer)
+	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(reader), writer(writer) {
 	}
 
 	~HdfsFileHandle() override {
@@ -53,6 +54,11 @@ struct HdfsFileHandle : public FileHandle {
 
 	void Close() override;
 
+	// The client this handle was opened on. Held so the reader/writer can
+	// never outlive it: a connection-level retry may drop the filesystem's
+	// cached client (see HdfsConnection::Invalidate) while this handle is
+	// still open.
+	std::shared_ptr<hdfs_client_t> client;
 	hdfs_reader_t *reader = nullptr;
 	hdfs_writer_t *writer = nullptr;
 	// Cursor for the streaming Read/Write/Seek interface.
@@ -174,13 +180,16 @@ private:
 	// Connections are created once and reused; the returned reference is stable.
 	HdfsConnection &GetConnection(const string &authority);
 
-	// Run `op(client, &status)` against a live client for `authority`. `op`
-	// returns true on success. If the first attempt fails with a connection-
-	// level error (stale client after a NameNode failover, a dropped socket, an
-	// expired ticket), the connection is invalidated and `op` is retried once on
-	// a freshly established client. The final outcome is left in `status` (OK on
-	// success, otherwise the last failure with its category and message). A
-	// failure to (re)connect propagates as an IOException.
+	// Run `op(client, &status)` against a live client for `authority`; `op`
+	// receives the shared_ptr keeping that client alive and returns true on
+	// success. An `op` handing out a resource tied to the client (a reader or
+	// writer) must copy the shared_ptr alongside it. If the first attempt fails
+	// with a connection-level error (stale client after a NameNode failover, a
+	// dropped socket, an expired ticket), the connection is invalidated and `op`
+	// is retried once on a freshly established client. The final outcome is
+	// left in `status` (OK on success, otherwise the last failure with its
+	// category and message). A failure to (re)connect propagates as an
+	// IOException.
 	template <class FN>
 	void Execute(const string &authority, BridgeStatus &status, FN &&op);
 

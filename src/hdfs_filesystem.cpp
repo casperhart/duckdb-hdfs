@@ -221,7 +221,7 @@ void HdfsFileSystem::Execute(const string &authority, BridgeStatus &status, FN &
 	for (int attempt = 0;; attempt++) {
 		status.Reset();
 		std::shared_ptr<hdfs_client_t> client = conn.Get(); // throws on connect failure
-		if (op(client.get(), &status)) {
+		if (op(client, &status)) {
 			return; // success; status == OK
 		}
 		if (attempt == 0 && status.IsConnection()) {
@@ -240,24 +240,30 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlag
 	string hdfs_path;
 	ParseHdfsPath(path, authority, hdfs_path);
 
+	// The handle keeps the client it was opened on alive (a retry elsewhere
+	// may drop the cached client while this handle is still open).
+	std::shared_ptr<hdfs_client_t> opened_on;
+
 	if (flags.OpenForWriting()) {
 		bool overwrite = flags.OverwriteExistingFile();
 		hdfs_writer_t *writer = nullptr;
 		BridgeStatus status;
-		Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-			writer = hdfs_bridge_create(client, hdfs_path.c_str(), overwrite, st);
+		Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+			writer = hdfs_bridge_create(client.get(), hdfs_path.c_str(), overwrite, st);
+			opened_on = client;
 			return writer != nullptr;
 		});
 		if (!writer) {
 			throw IOException("Failed to open HDFS file for writing '%s': %s", path, status.Message());
 		}
-		return make_uniq<HdfsFileHandle>(*this, path, flags, nullptr, writer);
+		return make_uniq<HdfsFileHandle>(*this, path, flags, std::move(opened_on), nullptr, writer);
 	}
 
 	hdfs_reader_t *reader = nullptr;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		reader = hdfs_bridge_open(client, hdfs_path.c_str(), st);
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		reader = hdfs_bridge_open(client.get(), hdfs_path.c_str(), st);
+		opened_on = client;
 		return reader != nullptr;
 	});
 	if (!reader) {
@@ -268,7 +274,7 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlag
 		}
 		throw IOException("Failed to open HDFS file for reading '%s': %s", path, status.Message());
 	}
-	auto handle = make_uniq<HdfsFileHandle>(*this, path, flags, reader, nullptr);
+	auto handle = make_uniq<HdfsFileHandle>(*this, path, flags, std::move(opened_on), reader, nullptr);
 	int64_t size = hdfs_bridge_file_size(reader);
 	handle->length = size < 0 ? 0 : static_cast<idx_t>(size);
 	return std::move(handle);
@@ -352,8 +358,8 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	ParseHdfsPath(handle.path, authority, hdfs_path);
 	hdfs_file_info_t info;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client.get(), hdfs_path.c_str(), &info, st) == 0;
 	});
 	if (!status.Ok()) {
 		throw IOException("Failed to stat HDFS file '%s': %s", handle.path, status.Message());
@@ -368,8 +374,8 @@ bool HdfsFileSystem::FileExists(const string &filename, optional_ptr<FileOpener>
 	ParseHdfsPath(filename, authority, hdfs_path);
 	hdfs_file_info_t info;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client.get(), hdfs_path.c_str(), &info, st) == 0;
 	});
 	if (status.Ok()) {
 		return !info.is_dir;
@@ -387,8 +393,8 @@ bool HdfsFileSystem::DirectoryExists(const string &directory, optional_ptr<FileO
 	ParseHdfsPath(directory, authority, hdfs_path);
 	hdfs_file_info_t info;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client.get(), hdfs_path.c_str(), &info, st) == 0;
 	});
 	if (status.Ok()) {
 		return info.is_dir;
@@ -404,8 +410,8 @@ void HdfsFileSystem::CreateDirectory(const string &directory, optional_ptr<FileO
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_mkdirs(client, hdfs_path.c_str(), st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_mkdirs(client.get(), hdfs_path.c_str(), st) == 0;
 	});
 	if (!status.Ok()) {
 		throw IOException("Failed to create HDFS directory '%s': %s", directory, status.Message());
@@ -417,8 +423,8 @@ void HdfsFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileO
 	string hdfs_path;
 	ParseHdfsPath(directory, authority, hdfs_path);
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/true, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_delete(client.get(), hdfs_path.c_str(), /*recursive=*/true, st) == 0;
 	});
 	if (!status.Ok()) {
 		throw IOException("Failed to remove HDFS directory '%s': %s", directory, status.Message());
@@ -430,8 +436,8 @@ void HdfsFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener>
 	string hdfs_path;
 	ParseHdfsPath(filename, authority, hdfs_path);
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_delete(client, hdfs_path.c_str(), /*recursive=*/false, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_delete(client.get(), hdfs_path.c_str(), /*recursive=*/false, st) == 0;
 	});
 	if (!status.Ok()) {
 		throw IOException("Failed to remove HDFS file '%s': %s", filename, status.Message());
@@ -452,8 +458,8 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 		                              target);
 	}
 	BridgeStatus status;
-	Execute(src_authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_rename(client, src_path.c_str(), dst_path.c_str(), /*overwrite=*/true, st) == 0;
+	Execute(src_authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_rename(client.get(), src_path.c_str(), dst_path.c_str(), /*overwrite=*/true, st) == 0;
 	});
 	if (!status.Ok()) {
 		throw IOException("Failed to move HDFS file '%s' -> '%s': %s", source, target, status.Message());
@@ -595,8 +601,8 @@ HdfsEntry HdfsFileSystem::Stat(const string &url) {
 
 	hdfs_dir_entry_t *entry = nullptr;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entry = hdfs_bridge_stat(client, hdfs_path.c_str(), st);
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		entry = hdfs_bridge_stat(client.get(), hdfs_path.c_str(), st);
 		return st->code == HDFS_OK;
 	});
 	if (!status.Ok()) {
@@ -613,8 +619,8 @@ bool HdfsFileSystem::Exists(const string &url) {
 	ParseHdfsPath(url, authority, hdfs_path);
 	hdfs_file_info_t info;
 	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		return hdfs_bridge_get_file_info(client, hdfs_path.c_str(), &info, st) == 0;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_get_file_info(client.get(), hdfs_path.c_str(), &info, st) == 0;
 	});
 	if (status.Ok()) {
 		return true;
