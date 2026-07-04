@@ -73,7 +73,6 @@ struct HdfsMetaBindData : public TableFunctionData {
 	HdfsFileSystem *hdfs = nullptr;
 	HdfsMetaOp op = HdfsMetaOp::LIST;
 	string path;
-	bool recursive = false;
 };
 
 unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindInput &input,
@@ -84,42 +83,50 @@ unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindI
 	result->op = info.op;
 	result->path = input.inputs[0].GetValue<string>();
 
-	auto recursive = input.named_parameters.find("recursive");
-	if (recursive != input.named_parameters.end()) {
-		result->recursive = BooleanValue::Get(recursive->second);
-	}
-
 	DefineMetadataSchema(return_types, names);
 	return std::move(result);
 }
 
-// LIST streams batches from a background walk as they arrive; GLOB and STAT
-// run their RPC once in Init and hold the resulting rows.
+// LIST and GLOB stream batches from a background walk as they arrive; STAT
+// runs its RPC once in Init and holds the resulting row.
 struct HdfsMetaGlobalState : public GlobalTableFunctionState {
 	unique_ptr<HdfsListStream> stream;
 	vector<HdfsEntry> entries;
 	idx_t offset = 0;
 };
 
+// hdfs_list_parallelism (registered at extension load) bounds the number of
+// concurrent listing RPCs of a walk that touches more than one directory.
+// Capped at INT32_MAX for the FFI signature.
+int32_t ListParallelism(ClientContext &context) {
+	Value setting;
+	if (context.TryGetCurrentSetting("hdfs_list_parallelism", setting)) {
+		return static_cast<int32_t>(
+		    MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+	}
+	return static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
+}
+
 unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
 	auto state = make_uniq<HdfsMetaGlobalState>();
 	switch (bind_data.op) {
-	case HdfsMetaOp::LIST: {
-		// hdfs_list_parallelism (registered at extension load) bounds the number
-		// of concurrent listing RPCs of a recursive walk; it has no effect on
-		// non-recursive listings. Capped at INT32_MAX for the FFI signature.
-		int32_t max_parallelism = 1;
-		Value setting;
-		if (context.TryGetCurrentSetting("hdfs_list_parallelism", setting)) {
-			max_parallelism = static_cast<int32_t>(
-			    MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+	case HdfsMetaOp::LIST:
+		// A path with glob characters returns the matched entries themselves
+		// (files and directories; `**` walks the subtree); a literal path
+		// lists the directory's children. Escapes don't suppress detection:
+		// like DuckDB's globber, any of these characters selects glob mode,
+		// and `\*` etc. are then matched literally by the pattern itself.
+		if (bind_data.path.find_first_of("*?[{") != string::npos) {
+			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context));
+		} else {
+			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context));
 		}
-		state->stream = bind_data.hdfs->OpenListStream(bind_data.path, bind_data.recursive, max_parallelism);
 		break;
-	}
 	case HdfsMetaOp::GLOB:
-		state->entries = bind_data.hdfs->GlobStatus(bind_data.path);
+		// Always pattern semantics: a literal path yields its own entry
+		// (where hdfs_ls would list a directory's children).
+		state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context));
 		break;
 	case HdfsMetaOp::STAT:
 		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path));
@@ -204,9 +211,8 @@ void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 } // namespace
 
 void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
-	// hdfs_ls(path, recursive := false)
+	// hdfs_ls(path_or_pattern)
 	auto ls = MakeMetaFunction("hdfs_ls");
-	ls.named_parameters["recursive"] = LogicalType::BOOLEAN;
 	ls.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::LIST);
 	loader.RegisterFunction(ls);
 

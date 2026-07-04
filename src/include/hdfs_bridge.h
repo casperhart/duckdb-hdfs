@@ -93,8 +93,6 @@ int32_t hdfs_bridge_close_writer(hdfs_writer_t *writer, hdfs_status_t *status);
 
 // Directory operations. Returned arrays are freed with hdfs_bridge_free_dir_entries.
 // A NULL return with `status->code == HDFS_OK` means an empty result (not an error).
-hdfs_dir_entry_t *hdfs_bridge_glob(hdfs_client_t *client, const char *pattern, int32_t *out_count,
-                                   hdfs_status_t *status);
 hdfs_dir_entry_t *hdfs_bridge_list_status(hdfs_client_t *client, const char *path, bool recursive, int32_t *out_count,
                                           hdfs_status_t *status);
 void hdfs_bridge_free_dir_entries(hdfs_dir_entry_t *entries, int32_t count);
@@ -109,6 +107,15 @@ void hdfs_bridge_free_dir_entries(hdfs_dir_entry_t *entries, int32_t count);
 // unfinished walk).
 hdfs_list_stream_t *hdfs_bridge_list_stream_open(hdfs_client_t *client, const char *path, bool recursive,
                                                  int32_t max_parallelism);
+// Streaming glob: like a listing stream, but `pattern` may contain wildcards
+// (`*`, `?`, `[...]` classes, `\` escapes, `{a,b}` alternation, and `**` as a
+// whole component matching zero or more levels). Matched entries — files and
+// directories — are returned themselves; matched directories are not listed.
+// Returns NULL with a non-OK status for an invalid pattern (unclosed brace
+// group, multiple `**`). A pattern matching nothing yields an empty stream;
+// other errors surface on the first _next call.
+hdfs_list_stream_t *hdfs_bridge_glob_stream_open(hdfs_client_t *client, const char *pattern, int32_t max_parallelism,
+                                                 hdfs_status_t *status);
 // Blocks until at least one entry is available; returns a batch of at most
 // `max_entries` (freed with hdfs_bridge_free_dir_entries). NULL with an OK
 // status means the listing is exhausted; NULL with a non-OK status is an error.

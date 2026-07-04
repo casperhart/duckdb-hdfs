@@ -20,6 +20,8 @@ use hdfs_native::{Client, ClientBuilder, HdfsError, WriteOptions};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
+use crate::glob::{GlobPlan, Pos};
+
 // The C++ filesystem issues concurrent positional reads against a single
 // `FileReader` (DuckDB's parquet reader reads ranges from multiple threads on
 // one handle). That is only sound if `FileReader` is `Sync`. Assert it at
@@ -141,9 +143,31 @@ impl BridgeClient {
         }
     }
 
-    /// Entries matching a glob `pattern`.
-    pub fn glob_status(&self, pattern: &str) -> Result<Vec<FileStatus>, HdfsError> {
-        self.block_on(self.inner.glob_status(pattern))
+    /// Start a streaming glob of `pattern` (see the [`crate::glob`] module for
+    /// the supported syntax), returning matched entries — files and
+    /// directories — themselves. `max_parallelism` (clamped to at least 1)
+    /// bounds the number of concurrent listing RPCs. Fails only on an invalid
+    /// pattern; a pattern matching nothing yields an empty stream.
+    pub fn glob_stream(
+        &self,
+        pattern: String,
+        max_parallelism: usize,
+    ) -> Result<BridgeListStream, HdfsError> {
+        let plan = GlobPlan::parse(&pattern)?;
+        let (tx, rx) = mpsc::channel(LIST_STREAM_BUFFER);
+        let task = self.rt.spawn(glob_walk(
+            self.inner.clone(),
+            plan,
+            max_parallelism.max(1),
+            tx,
+        ));
+        Ok(BridgeListStream {
+            rx,
+            task: Some(task),
+            rt: Arc::clone(&self.rt),
+            path: pattern,
+            pending_error: None,
+        })
     }
 
     /// Create directory `path` (and any missing parents) with mode 0o755.
@@ -319,6 +343,84 @@ async fn stream_walk(
                 }
             }
             Some(Err(e)) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+            None => return, // queue drained and nothing in flight: walk complete
+        }
+    }
+}
+
+/// Walk the tree from `plan`'s literal root, sending every entry matching the
+/// glob over `tx`. Same scheduling as [`stream_walk`] (flat work queue, up to
+/// `max_parallelism` listing RPCs in flight, backpressure via the channel),
+/// but each queued directory carries its NFA states and children are filtered
+/// through [`GlobPlan::step`], which prunes descent to directories that can
+/// still match. Missing paths are pruned silently (a glob matching nothing is
+/// not an error); any other error is forwarded and ends the walk.
+async fn glob_walk(
+    client: Client,
+    plan: GlobPlan,
+    max_parallelism: usize,
+    tx: mpsc::Sender<Result<FileStatus, HdfsError>>,
+) {
+    let client = &client;
+    // An all-literal pattern (or brace alternative) matches the root itself.
+    if plan.emit_root() {
+        match client.get_file_info(plan.root()).await {
+            Ok(status) => {
+                if tx.send(Ok(status)).await.is_err() {
+                    return;
+                }
+            }
+            Err(HdfsError::FileNotFound(_)) => {}
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+    let mut pending: VecDeque<(String, Vec<Pos>)> = VecDeque::new();
+    if !plan.initial().is_empty() {
+        pending.push_back((plan.root().to_string(), plan.initial().to_vec()));
+    }
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        while in_flight.len() < max_parallelism {
+            match pending.pop_front() {
+                Some((path, states)) => in_flight.push(async move {
+                    let listing = client.list_status(&path, false).await;
+                    (path, states, listing)
+                }),
+                None => break,
+            }
+        }
+        match in_flight.next().await {
+            Some((path, states, Ok(children))) => {
+                for child in children {
+                    // Listing a file returns the file itself; it has no
+                    // children to match.
+                    if child.path == path {
+                        continue;
+                    }
+                    let name = child
+                        .path
+                        .rsplit_once('/')
+                        .map(|(_, n)| n)
+                        .unwrap_or(child.path.as_str());
+                    let step = plan.step(&states, name, child.isdir);
+                    if child.isdir && !step.next.is_empty() {
+                        pending.push_back((child.path.clone(), step.next));
+                    }
+                    if step.emit && tx.send(Ok(child)).await.is_err() {
+                        return; // consumer dropped the stream
+                    }
+                }
+            }
+            // The root (or, in a race, a directory found earlier) is gone:
+            // that's zero matches down this branch, not an error.
+            Some((_, _, Err(HdfsError::FileNotFound(_)))) => {}
+            Some((_, _, Err(e))) => {
                 let _ = tx.send(Err(e)).await;
                 return;
             }

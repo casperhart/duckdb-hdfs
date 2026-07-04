@@ -14,6 +14,10 @@ struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
 class HdfsConnection; // A reconnectable, lazily-established client for one authority.
 class HdfsFileSystem;
 
+// Default for the hdfs_list_parallelism setting (registered in
+// hdfs_extension.cpp); also the fallback when no setting context is available.
+static constexpr uint64_t DEFAULT_HDFS_LIST_PARALLELISM = 16;
+
 // A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
 // hdfs_glob / hdfs_stat table functions. `url` carries the authority back
 // (e.g. "hdfs://host:port/a/b"); `name` is the basename. `replication` and
@@ -57,12 +61,13 @@ struct HdfsFileHandle : public FileHandle {
 	idx_t length = 0;
 };
 
-// A streaming directory listing backing hdfs_ls: a background walk in the
-// bridge produces entries while Next() hands them out in batches, so rows
-// flow before a large tree is fully listed. Recursive listings fan out up to
-// `max_parallelism` concurrent listing RPCs and deliver entries in completion
-// order (no global ordering guarantee). Not thread-safe: drive from one
-// thread at a time. Created via HdfsFileSystem::OpenListStream().
+// A streaming listing or glob backing hdfs_ls / hdfs_glob: a background walk
+// in the bridge produces entries while Next() hands them out in batches, so
+// rows flow before a large tree is fully walked. Walks touching more than one
+// directory fan out up to `max_parallelism` concurrent listing RPCs and
+// deliver entries in completion order (no global ordering guarantee). Not
+// thread-safe: drive from one thread at a time. Created via
+// HdfsFileSystem::OpenListStream() / OpenGlobStream().
 class HdfsListStream {
 public:
 	~HdfsListStream();
@@ -84,8 +89,8 @@ private:
 
 	string url;       // original URL, for error messages
 	string authority; // "hdfs://host:port", or "" for the default FS
-	string hdfs_path; // scheme-less path
-	bool recursive = false;
+	string hdfs_path; // scheme-less path (a pattern when `glob`)
+	bool glob = false;
 	int32_t max_parallelism = 1;
 	HdfsConnection *conn = nullptr; // owned by the filesystem, which outlives us
 	std::shared_ptr<hdfs_client_t> client;
@@ -137,14 +142,17 @@ public:
 	// (which drops directories and exposes only type/size/mtime), these carry the
 	// full FileStatus and keep directory entries.
 	//
-	// OpenListStream: streaming listing of `url`'s immediate children (or the
-	//   whole subtree when recursive); a file path yields that single entry.
-	//   For recursive listings, `max_parallelism > 1` bounds the number of
-	//   concurrent listing RPCs (the hdfs_list_parallelism setting).
-	// GlobStatus: entries matching a wildcard `pattern`, directories included.
-	// Stat:       metadata for a single `url` (file or directory).
-	unique_ptr<HdfsListStream> OpenListStream(const string &url, bool recursive, int32_t max_parallelism = 1);
-	vector<HdfsEntry> GlobStatus(const string &pattern);
+	// OpenListStream: streaming listing of `url`'s immediate children; a file
+	//   path yields that single entry. The path is taken literally.
+	// OpenGlobStream: streaming glob of a wildcard `url`; matched entries are
+	//   returned themselves, directories included. Throws on an invalid
+	//   pattern; a pattern matching nothing yields an empty stream.
+	// Stat: metadata for a single `url` (file or directory).
+	//
+	// `max_parallelism` bounds the concurrent listing RPCs of walks that touch
+	// more than one directory (the hdfs_list_parallelism setting).
+	unique_ptr<HdfsListStream> OpenListStream(const string &url, int32_t max_parallelism = 1);
+	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, int32_t max_parallelism = 1);
 	HdfsEntry Stat(const string &url);
 	// True if `url` exists (file or directory); a single stat RPC.
 	bool Exists(const string &url);

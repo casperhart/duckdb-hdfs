@@ -19,8 +19,8 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 - Reading any file format DuckDB supports (Parquet, CSV, JSON, …) over `hdfs://`.
 - Writing via `COPY ... TO 'hdfs://...'` (HDFS is append-only; random writes are
   not supported).
-- Globbing (`hdfs://host:port/dir/*.parquet`), directory listing, `FileExists`,
-  size/last-modified metadata.
+- Globbing (`hdfs://host:port/dir/*.parquet`, `.../dir/**/*.parquet`),
+  directory listing, `FileExists`, size/last-modified metadata.
 - Directory and file management: create/remove directories, remove files, rename
   (move).
 - Concurrent positional reads (DuckDB's parallel Parquet reader) on a single
@@ -42,15 +42,17 @@ unlike DuckDB's built-in `glob()`, they include directories.
 SELECT name, type, size, owner, permissions
 FROM hdfs_ls('hdfs://namenode:8020/data');
 
--- Walk the whole subtree.
-SELECT * FROM hdfs_ls('hdfs://namenode:8020/data', recursive := true);
+-- Walk the whole subtree ('**' matches zero or more path levels).
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/**');
 
--- Filter with SQL rather than a shell glob (replaces `hdfs dfs -ls -d .../temp_*`).
+-- Glob patterns return the matched entries themselves (directories kept).
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/year=*/month=*/*.parquet');
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/**/*.parquet');
+SELECT * FROM hdfs_ls('hdfs://namenode:8020/logs/2026-0{1,2,3}/*.gz');
+
+-- Filter with SQL rather than a glob when one directory is enough (one RPC).
 SELECT * FROM hdfs_ls('hdfs://namenode:8020/data')
 WHERE starts_with(name, 'temp_');
-
--- Expand a wildcard pattern across the tree (directories kept).
-SELECT * FROM hdfs_glob('hdfs://namenode:8020/data/year=*/month=*/*.parquet');
 
 -- Metadata for one path (file or directory), as a single row.
 SELECT * FROM hdfs_stat('hdfs://namenode:8020/data');
@@ -65,19 +67,30 @@ compose/`UNION`): `path` (full `hdfs://` URL), `name` (basename), `type`
 `rwxr-xr-x`), `mode` (raw permission bits), `replication`, `block_size` (both
 `NULL` for directories), `last_modified`, `last_accessed`.
 
-**`hdfs_ls` vs `hdfs_glob`.** `hdfs_ls` takes a *literal* directory path
-(`getListing`) and returns its children, showing subdirectories as rows without
-descending into them. `hdfs_glob` takes a *pattern* and returns the matched
-entries as-is. A wildcard passed to `hdfs_ls` is matched literally (and errors
-with a hint to use `hdfs_glob`).
+**Glob syntax and semantics.** Patterns follow DuckDB's globber — `*` (within
+one path level), `?`, `[abc]` / `[a-b]` / `[!abc]` character classes, `\`
+escapes, and `**` as a whole component matching zero or more levels (at most
+one per pattern) — extended with Hadoop-style `{a,b}` alternation, which may
+span `/` (`/data/{2024/12,2025/01}/*`). A path containing any of `* ? [ {`
+switches `hdfs_ls` to glob semantics: matched entries come back *as rows
+themselves* (like `ls -d`, or `hdfs_glob`), files and directories both, and a
+pattern matching nothing returns an empty result rather than an error. A path
+without wildcards keeps plain `ls` semantics: a directory lists its children.
+Unlike the shell, `*` also matches dot-prefixed names, and rows arrive in
+completion order — use `ORDER BY path` when order matters. `hdfs_glob` is the
+same walk with pattern semantics always on (a literal path returns its own
+entry instead of listing children). The same globber backs `read_parquet` /
+`read_csv` / `glob()` over `hdfs://`, so `**` works there too.
 
-**Keeping it fast.** HDFS has no server-side glob RPC, so `hdfs_glob` expands
-wildcards client-side by walking the tree with one `getListing` per matching
-directory — cost scales with the pattern's fan-out. Prefer an anchored literal
-prefix (`/data/2024/*` over `/*/*/*`), keep wildcards shallow, and for
-single-directory filtering use `hdfs_ls(dir) WHERE …` (one RPC) rather than a
-glob. Requesting the full metadata columns adds **no** extra RPCs — HDFS already
-returns them in the same listing call.
+**Keeping it fast.** HDFS has no server-side glob RPC, so patterns expand
+client-side by walking the tree with one `getListing` per directory that can
+still match — cost scales with the pattern's fan-out, and up to
+`hdfs_list_parallelism` listings run concurrently. Nothing above the pattern's
+literal prefix is listed (`/data/2024/*` starts at `/data/2024`), so anchor
+patterns as deep as you can; `**` necessarily walks the whole subtree below
+its anchor. For single-directory filtering, `hdfs_ls(dir) WHERE …` (one RPC)
+beats a glob. Requesting the full metadata columns adds **no** extra RPCs —
+HDFS already returns them in the same listing call.
 
 These functions are read-only (metadata queries); the extension does not expose
 SQL functions that mutate the filesystem.
@@ -94,7 +107,7 @@ your Hadoop config (`fs.defaultFS`).
 
 | Setting | Default | Description |
 |---|---|---|
-| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by recursive listings (`hdfs_ls(..., recursive := true)`). Listings stream: rows are produced while the tree walk is still in flight, and recursive results arrive in completion order (no ordering guarantee — use `ORDER BY` if order matters). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
+| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by listings and globs that walk more than one directory (`hdfs_ls('/path/**')`, `read_parquet('.../**/*.parquet')`, …). Walks stream: rows are produced while the tree walk is still in flight, and multi-directory results arrive in completion order (no ordering guarantee — use `ORDER BY` if order matters). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
 
 ```sql
 SET hdfs_list_parallelism = 64;

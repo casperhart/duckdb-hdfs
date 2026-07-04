@@ -2,7 +2,10 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
+#include "duckdb/common/helper.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/vector_size.hpp"
 
 #include <memory>
 
@@ -46,6 +49,16 @@ shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const hdfs_dir_entry_t &entry)
 	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
 	options.emplace("file_size", Value::BIGINT(entry.length));
 	// HDFS modification times are epoch milliseconds.
+	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime))));
+	return ext;
+}
+
+// Same, from an already-converted HdfsEntry (the streaming glob path).
+shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
+	auto ext = make_shared_ptr<ExtendedOpenFileInfo>();
+	auto &options = ext->options;
+	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
+	options.emplace("file_size", Value::BIGINT(entry.size));
 	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime))));
 	return ext;
 }
@@ -494,40 +507,31 @@ bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::funct
 }
 
 vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener) {
-	string authority;
-	string hdfs_path;
-	ParseHdfsPath(path, authority, hdfs_path);
-
-	int32_t count = 0;
-	hdfs_dir_entry_t *entries = nullptr;
-	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entries = hdfs_bridge_glob(client, hdfs_path.c_str(), &count, st);
-		// Null + OK means "no matches"; only a non-OK status is an error.
-		return st->code == HDFS_OK;
-	});
-	if (!status.Ok()) {
-		throw IOException("Failed to glob HDFS path '%s': %s", path, status.Message());
+	int32_t max_parallelism = static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
+	Value setting;
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_list_parallelism", setting)) {
+		max_parallelism =
+		    static_cast<int32_t>(MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
 	}
+	auto stream = OpenGlobStream(path, max_parallelism);
 	vector<OpenFileInfo> result;
-	result.reserve(count);
-	for (int32_t i = 0; i < count; i++) {
-		// glob_status matches directories too (e.g. "dir/*" yields subdirs). We
-		// don't implement the extended-glob path, so DuckDB wraps these results
-		// without filtering and would try to open a directory as a data file.
-		// Drop directories here so only files reach the multi-file readers.
-		if (entries[i].is_dir) {
-			continue;
+	vector<HdfsEntry> batch;
+	while (stream->Next(batch, STANDARD_VECTOR_SIZE)) {
+		for (auto &entry : batch) {
+			// The glob matches directories too (e.g. "dir/*" yields subdirs). We
+			// don't implement the extended-glob path, so DuckDB wraps these
+			// results without filtering and would try to open a directory as a
+			// data file. Drop directories here so only files reach the
+			// multi-file readers.
+			if (entry.is_dir) {
+				continue;
+			}
+			OpenFileInfo info(entry.url);
+			// Carry the metadata the glob already returned so DuckDB can read
+			// size/mtime without re-statting each file.
+			info.extended_info = MakeExtendedInfo(entry);
+			result.push_back(std::move(info));
 		}
-		string child = entries[i].path ? string(entries[i].path) : string();
-		OpenFileInfo info(MakeUrl(authority, child));
-		// Carry the metadata the glob already returned so DuckDB can read
-		// size/mtime without re-statting each file.
-		info.extended_info = MakeExtendedInfo(entries[i]);
-		result.push_back(std::move(info));
-	}
-	if (entries) {
-		hdfs_bridge_free_dir_entries(entries, count);
 	}
 	return result;
 }
@@ -540,7 +544,17 @@ HdfsListStream::~HdfsListStream() {
 
 void HdfsListStream::Open() {
 	client = conn->Get(); // throws on connect failure
-	handle = hdfs_bridge_list_stream_open(client.get(), hdfs_path.c_str(), recursive, max_parallelism);
+	if (glob) {
+		BridgeStatus status;
+		handle = hdfs_bridge_glob_stream_open(client.get(), hdfs_path.c_str(), max_parallelism, &status);
+		if (!handle) {
+			// Only an invalid pattern fails here; matching nothing is an
+			// empty stream, and cluster errors surface in Next().
+			throw IOException("Failed to glob HDFS pattern '%s': %s", url, status.Message());
+		}
+	} else {
+		handle = hdfs_bridge_list_stream_open(client.get(), hdfs_path.c_str(), /*recursive=*/false, max_parallelism);
+	}
 }
 
 bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries) {
@@ -573,56 +587,33 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries) {
 			Open();
 			continue;
 		}
-		// hdfs_ls treats its argument literally; a wildcard here won't expand.
-		// Point the user at hdfs_glob rather than a bare "not found".
-		if (status.IsNotFound() && hdfs_path.find_first_of("*?[{") != string::npos) {
-			throw IOException("hdfs_ls path '%s' looks like a glob pattern but is matched literally; "
-			                  "use hdfs_glob() for wildcard patterns",
-			                  url);
+		if (glob) {
+			throw IOException("Failed to glob HDFS pattern '%s': %s", url, status.Message());
 		}
 		throw IOException("Failed to list HDFS path '%s': %s", url, status.Message());
 	}
 }
 
-unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, bool recursive, int32_t max_parallelism) {
+unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, int32_t max_parallelism) {
 	// Not make_uniq: the constructor is private to keep construction here.
 	auto stream = unique_ptr<HdfsListStream>(new HdfsListStream());
 	stream->url = url;
 	ParseHdfsPath(url, stream->authority, stream->hdfs_path);
-	stream->recursive = recursive;
 	stream->max_parallelism = max_parallelism;
 	stream->conn = &GetConnection(stream->authority);
 	stream->Open();
 	return stream;
 }
 
-vector<HdfsEntry> HdfsFileSystem::GlobStatus(const string &pattern) {
-	string authority;
-	string hdfs_path;
-	ParseHdfsPath(pattern, authority, hdfs_path);
-
-	int32_t count = 0;
-	hdfs_dir_entry_t *entries = nullptr;
-	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entries = hdfs_bridge_glob(client, hdfs_path.c_str(), &count, st);
-		// Null + OK means "no matches"; only a non-OK status is an error.
-		return st->code == HDFS_OK;
-	});
-	if (!status.Ok()) {
-		throw IOException("Failed to glob HDFS path '%s': %s", pattern, status.Message());
-	}
-	vector<HdfsEntry> result;
-	result.reserve(count);
-	// Unlike Glob(), keep directory matches: the metadata functions surface them
-	// as rows rather than feeding a multi-file reader.
-	for (int32_t i = 0; i < count; i++) {
-		result.push_back(MakeHdfsEntry(authority, entries[i]));
-	}
-	if (entries) {
-		hdfs_bridge_free_dir_entries(entries, count);
-	}
-	return result;
+unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, int32_t max_parallelism) {
+	auto stream = unique_ptr<HdfsListStream>(new HdfsListStream());
+	stream->url = url;
+	ParseHdfsPath(url, stream->authority, stream->hdfs_path);
+	stream->glob = true;
+	stream->max_parallelism = max_parallelism;
+	stream->conn = &GetConnection(stream->authority);
+	stream->Open();
+	return stream;
 }
 
 HdfsEntry HdfsFileSystem::Stat(const string &url) {

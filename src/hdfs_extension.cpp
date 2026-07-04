@@ -18,9 +18,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("hdfs_list_parallelism",
-	                          "Maximum number of concurrent HDFS directory-listing RPCs used by recursive "
-	                          "listings (hdfs_ls(..., recursive := true)); 1 disables parallelism",
-	                          LogicalType::UBIGINT, Value::UBIGINT(16));
+	                          "Maximum number of concurrent HDFS directory-listing RPCs used by listings and "
+	                          "globs that walk more than one directory (e.g. hdfs_ls('/path/**')); 1 disables "
+	                          "parallelism",
+	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HDFS_LIST_PARALLELISM));
 
 	auto &fs = db.GetFileSystem();
 	auto hdfs_fs = make_uniq<HdfsFileSystem>();

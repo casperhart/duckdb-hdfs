@@ -25,6 +25,7 @@
 //!   with the matching `hdfs_bridge_free_*` function.
 
 mod client;
+mod glob;
 
 pub use client::{BridgeClient, BridgeListStream, BridgeReader, BridgeWriter};
 
@@ -429,29 +430,6 @@ fn statuses_to_entries(
     Box::into_raw(boxed) as *mut DirEntry
 }
 
-/// Glob `pattern`, returning matching entries. `out_count` receives the count.
-/// A null return with `status->code == HDFS_OK` means no matches.
-#[no_mangle]
-pub unsafe extern "C" fn hdfs_bridge_glob(
-    client: *mut BridgeClient,
-    pattern: *const c_char,
-    out_count: *mut i32,
-    status: *mut Status,
-) -> *mut DirEntry {
-    let client = unsafe { &*client };
-    let pattern = unsafe { CStr::from_ptr(pattern) }.to_string_lossy();
-    match client.glob_status(&pattern) {
-        Ok(statuses) => statuses_to_entries(statuses, out_count),
-        Err(e) => {
-            unsafe {
-                *out_count = 0;
-                set_error(status, format_args!("glob '{pattern}' failed"), &e);
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
 /// List the children of directory `path`. When `recursive` is true the whole
 /// subtree is walked. A null return with `status->code == HDFS_OK` means an
 /// empty directory. For large or recursive listings prefer the streaming API
@@ -498,6 +476,33 @@ pub unsafe extern "C" fn hdfs_bridge_list_stream_open(
         .into_owned();
     let stream = client.list_stream(path, recursive, max_parallelism.max(1) as usize);
     Box::into_raw(Box::new(stream))
+}
+
+/// Start a streaming glob of `pattern`: matched entries — files and
+/// directories — are returned themselves (no descent into matched
+/// directories). Supports `*`, `?`, `[...]` classes, `\` escapes, `{a,b}`
+/// alternation, and `**` as a whole component matching zero or more levels.
+/// `max_parallelism` bounds the number of concurrent listing RPCs. Returns
+/// null with a non-OK status for an invalid pattern; a pattern matching
+/// nothing yields an empty stream, and other errors surface on `next`.
+#[no_mangle]
+pub unsafe extern "C" fn hdfs_bridge_glob_stream_open(
+    client: *mut BridgeClient,
+    pattern: *const c_char,
+    max_parallelism: i32,
+    status: *mut Status,
+) -> *mut BridgeListStream {
+    let client = unsafe { &*client };
+    let pattern = unsafe { CStr::from_ptr(pattern) }
+        .to_string_lossy()
+        .into_owned();
+    match client.glob_stream(pattern, max_parallelism.max(1) as usize) {
+        Ok(stream) => Box::into_raw(Box::new(stream)),
+        Err(e) => {
+            unsafe { set_error(status, "invalid glob pattern", &e) };
+            ptr::null_mut()
+        }
+    }
 }
 
 /// Fetch the next batch of entries (at most `max_entries`), blocking until at
