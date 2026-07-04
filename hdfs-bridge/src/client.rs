@@ -4,13 +4,16 @@
 //! drives it and exposes blocking methods, so the FFI layer (`lib.rs`) never
 //! touches async code or the underlying objects directly.
 //!
-//! Field order matters in these structs: `inner` is declared before `rt` so
-//! the hdfs-native object (whose `Drop` may use the runtime, e.g. a writer
-//! releasing its file lease) is dropped while the runtime is still alive.
+//! All handles share one process-wide runtime (see [`shared_runtime`]):
+//! clients are created per authority and again on every reconnect, so a
+//! runtime per client (each with a worker thread per CPU core) would multiply
+//! OS threads for no benefit. Handles still hold an `Arc` to the runtime so
+//! an object whose `Drop` needs it (e.g. a writer releasing its file lease)
+//! can never outlive it, whatever the drop order.
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -39,7 +42,33 @@ const _: fn() = || {
     assert_send::<BridgeListStream>();
 };
 
-/// An HDFS client plus the Tokio runtime all its operations run on.
+/// The process-wide Tokio runtime that drives all HDFS IO. Created on first
+/// use and kept alive for the life of the process. A failure to start it is
+/// returned rather than cached, so a later connect can try again.
+fn shared_runtime() -> Result<Arc<Runtime>, HdfsError> {
+    static RUNTIME: Mutex<Option<Arc<Runtime>>> = Mutex::new(None);
+    // Recover a poisoned lock instead of panicking across the FFI boundary; a
+    // poisoning panic can only have happened before the slot was written.
+    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rt) = slot.as_ref() {
+        return Ok(Arc::clone(rt));
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("hdfs-bridge-io")
+        .build()
+        .map_err(|e| {
+            HdfsError::IOError(std::io::Error::new(
+                e.kind(),
+                format!("failed to start IO runtime: {e}"),
+            ))
+        })?;
+    let rt = Arc::new(rt);
+    *slot = Some(Arc::clone(&rt));
+    Ok(rt)
+}
+
+/// An HDFS client plus the shared Tokio runtime its operations run on.
 pub struct BridgeClient {
     inner: Client,
     rt: Arc<Runtime>,
@@ -53,13 +82,7 @@ impl BridgeClient {
         config_dir: Option<String>,
         user: Option<String>,
     ) -> Result<Self, HdfsError> {
-        let rt = Runtime::new().map_err(|e| {
-            HdfsError::IOError(std::io::Error::new(
-                e.kind(),
-                format!("failed to start IO runtime: {e}"),
-            ))
-        })?;
-        let rt = Arc::new(rt);
+        let rt = shared_runtime()?;
         // The client spawns its IO tasks on our runtime; a plain `build()`
         // would lazily create a second, hidden runtime.
         let mut builder = ClientBuilder::new().with_io_runtime(rt.handle().clone());
@@ -426,5 +449,17 @@ async fn glob_walk(
             }
             None => return, // queue drained and nothing in flight: walk complete
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn runtime_is_process_wide() {
+        let a = shared_runtime().unwrap();
+        let b = shared_runtime().unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
     }
 }

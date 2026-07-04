@@ -3,8 +3,9 @@
 //!
 //! This file is only the C boundary: argument/result marshalling and error
 //! translation. The blocking wrappers around the async `hdfs-native` client
-//! live in the [`client`] module, which drives the client on a Tokio runtime
-//! it owns (rather than using `hdfs_native::sync`, which hides its runtime).
+//! live in the [`client`] module, which drives all clients on one
+//! process-wide Tokio runtime the bridge owns (rather than using
+//! `hdfs_native::sync`, which hides its runtime).
 //! Owning the runtime lets the bridge run custom concurrent operations —
 //! notably the parallel streaming listing behind
 //! [`hdfs_bridge_list_stream_open`].
