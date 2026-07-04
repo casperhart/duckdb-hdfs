@@ -10,8 +10,7 @@ cluster used to exercise the `hdfs` extension end-to-end.
   up.
 - `docker/` — a single-node HDFS (NameNode + DataNode) image + compose file.
 - `hdfs-conf/` — host-side Hadoop client config (`core-site.xml` /
-  `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`
-  or the `hdfs_config_dir` setting.
+  `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`.
 - `scripts/` — `hdfs_up.sh`, `hdfs_down.sh`, and `run_hdfs_tests.sh`.
 
 ## Running

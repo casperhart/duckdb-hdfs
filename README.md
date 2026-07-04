@@ -17,8 +17,8 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 ## What works
 
 - Reading any file format DuckDB supports (Parquet, CSV, JSON, …) over `hdfs://`.
-- Writing via `COPY ... TO 'hdfs://...'` (HDFS is append-only; random writes are
-  not supported).
+- Writing via `COPY ... TO 'hdfs://...'`, including `PARTITION_BY` (HDFS is
+  append-only; random writes are not supported).
 - Globbing (`hdfs://host:port/dir/*.parquet`, `.../dir/**/*.parquet`),
   directory listing, `FileExists`, size/last-modified metadata.
 - Directory and file management: create/remove directories, remove files, rename
@@ -107,7 +107,7 @@ your Hadoop config (`fs.defaultFS`).
 
 | Setting | Default | Description |
 |---|---|---|
-| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by listings and globs that walk more than one directory (`hdfs_ls('/path/**')`, `read_parquet('.../**/*.parquet')`, …). Walks stream: rows are produced while the tree walk is still in flight, and multi-directory results arrive in completion order (no ordering guarantee — use `ORDER BY` if order matters). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
+| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by listings and globs that walk more than one directory (`hdfs_ls('/path/**')`, `read_parquet('.../**/*.parquet')`, …). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
 
 ```sql
 SET hdfs_list_parallelism = 64;
@@ -170,7 +170,7 @@ Or manage the cluster manually:
 
 ```sh
 test/scripts/hdfs_up.sh           # build image, start HDFS, seed fixtures under /test
-HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="$(pwd)/test/hdfs-conf" \
+HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="$(pwd)/test/hdfs-conf" HADOOP_USER_NAME=hadoop \
     build/release/test/unittest test/sql/hdfs.test
 test/scripts/hdfs_down.sh
 ```
@@ -183,7 +183,8 @@ as `localhost` and setting `dfs.client.use.datanode.hostname=true` on the client
 ## Layout
 
 - `src/` — DuckDB extension (C++): `hdfs_extension.cpp` registers the filesystem
-  and settings; `hdfs_filesystem.cpp` implements the `FileSystem`.
+  and settings; `hdfs_filesystem.cpp` implements the `FileSystem`;
+  `hdfs_functions.cpp` implements the metadata SQL functions.
 - `src/include/hdfs_bridge.h` — C ABI exposed by the Rust bridge; generated
   from the Rust definitions by cbindgen on `cargo build` (do not edit).
 - `hdfs-bridge/` — Rust staticlib wrapping `hdfs-native` behind that C ABI.
