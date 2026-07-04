@@ -1,6 +1,7 @@
-//! Recursive-listing benchmark: the old sequential walk (`hdfs_bridge_list_status`
-//! with `recursive = true`, i.e. hdfs-native's lazy one-RPC-at-a-time iterator)
-//! vs the streaming parallel walk (`hdfs_bridge_list_stream_*`), on a Hive-style
+//! Recursive-listing benchmark: the sequential walk (hdfs-native's lazy
+//! one-RPC-at-a-time recursive iterator, which the bridge exposed as
+//! `hdfs_bridge_list_status` before the streaming API replaced it) vs the
+//! streaming parallel walk (`hdfs_bridge_list_stream_*`), on a Hive-style
 //! partition tree (`year=YYYY/month=MM/day=DD`, one empty marker file per day).
 //!
 //! Network latency is simulated by a local TCP proxy in front of the NameNode
@@ -24,16 +25,15 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt as _};
-use hdfs_native::{ClientBuilder, WriteOptions};
+use hdfs_native::{Client, ClientBuilder, WriteOptions};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use hdfs_bridge::{
-    hdfs_bridge_connect, hdfs_bridge_free_dir_entries, hdfs_bridge_list_status,
-    hdfs_bridge_list_stream_free, hdfs_bridge_list_stream_next, hdfs_bridge_list_stream_open,
-    BridgeClient, Status,
+    hdfs_bridge_connect, hdfs_bridge_free_dir_entries, hdfs_bridge_list_stream_free,
+    hdfs_bridge_list_stream_next, hdfs_bridge_list_stream_open, BridgeClient, Status,
 };
 
 const NAMENODE: &str = "127.0.0.1:9000";
@@ -78,8 +78,17 @@ fn main() {
         "variant", "min", "mean", "max", "first-rows", "entries"
     );
 
-    let seq = bench("sequential (old)", 3, || unsafe {
-        let (total, n) = run_sequential(client, &root);
+    // Baseline: hdfs-native's own recursive listing, dialed through the same
+    // proxy so both variants see the same latency. This is the sequential
+    // iterator the bridge wrapped before the streaming API replaced it.
+    let seq_client = ClientBuilder::new()
+        .with_url(format!("hdfs://{proxy}"))
+        .with_user("hadoop")
+        .with_io_runtime(rt.handle().clone())
+        .build()
+        .unwrap();
+    let seq = bench("sequential (baseline)", 3, || {
+        let (total, n) = run_sequential(&rt, &seq_client);
         (total, None, n)
     });
 
@@ -141,17 +150,12 @@ fn report(name: &str, samples: &[Sample], baseline: Option<Duration>) {
 
 // --- the two listing paths under test ----------------------------------------
 
-unsafe fn run_sequential(client: *mut BridgeClient, root: &CString) -> (Duration, usize) {
+/// hdfs-native's plain recursive listing: one `getListing` RPC at a time, the
+/// full result materialized before any entry is available.
+fn run_sequential(rt: &Runtime, client: &Client) -> (Duration, usize) {
     let start = Instant::now();
-    let mut count = 0i32;
-    let mut st = ok_status();
-    let entries = hdfs_bridge_list_status(client, root.as_ptr(), true, &mut count, &mut st);
-    let elapsed = start.elapsed();
-    check(&st, "list_status");
-    if !entries.is_null() {
-        hdfs_bridge_free_dir_entries(entries, count);
-    }
-    (elapsed, count as usize)
+    let statuses = rt.block_on(client.list_status(ROOT, true)).unwrap();
+    (start.elapsed(), statuses.len())
 }
 
 unsafe fn run_stream(

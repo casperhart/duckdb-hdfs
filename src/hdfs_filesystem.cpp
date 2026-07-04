@@ -39,26 +39,16 @@ void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
 	}
 }
 
-// Build DuckDB's extended metadata from a bridge directory entry. The bridge
+// Build DuckDB's extended metadata from a listing/glob entry. The bridge
 // already returns type/size/mtime for every glob and listing entry, so handing
 // them to DuckDB here lets glob expansion, the external file cache, and the
 // glob()/read_blob/read_text functions avoid a second per-file stat RPC.
-shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const hdfs_dir_entry_t &entry) {
-	auto ext = make_shared_ptr<ExtendedOpenFileInfo>();
-	auto &options = ext->options;
-	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
-	options.emplace("file_size", Value::BIGINT(entry.length));
-	// HDFS modification times are epoch milliseconds.
-	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime))));
-	return ext;
-}
-
-// Same, from an already-converted HdfsEntry (the streaming glob path).
 shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 	auto ext = make_shared_ptr<ExtendedOpenFileInfo>();
 	auto &options = ext->options;
 	options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
 	options.emplace("file_size", Value::BIGINT(entry.size));
+	// HDFS modification times are epoch milliseconds.
 	options.emplace("last_modified", Value::TIMESTAMP(Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime))));
 	return ext;
 }
@@ -472,38 +462,20 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 
 bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
                                        optional_ptr<FileOpener> opener) {
-	string authority;
-	string hdfs_path;
-	ParseHdfsPath(directory, authority, hdfs_path);
-
-	int32_t count = 0;
-	hdfs_dir_entry_t *entries = nullptr;
-	BridgeStatus status;
-	Execute(authority, status, [&](hdfs_client_t *client, hdfs_status_t *st) {
-		entries = hdfs_bridge_list_status(client, hdfs_path.c_str(), /*recursive=*/false, &count, st);
-		// A null result with an OK status is an empty directory, not a failure;
-		// the status code is the sole success signal.
-		return st->code == HDFS_OK;
-	});
-	if (!status.Ok()) {
-		throw IOException("Failed to list HDFS directory '%s': %s", directory, status.Message());
-	}
-	for (int32_t i = 0; i < count; i++) {
-		// Listing reports bare child names, not full paths.
-		string full = entries[i].path ? string(entries[i].path) : string();
-		string name = full;
-		size_t slash = full.find_last_of('/');
-		if (slash != string::npos) {
-			name = full.substr(slash + 1);
+	// A single directory has no fan-out, so parallelism buys nothing here.
+	auto stream = OpenListStream(directory);
+	bool any = false;
+	vector<HdfsEntry> batch;
+	while (stream->Next(batch, STANDARD_VECTOR_SIZE)) {
+		for (auto &entry : batch) {
+			// The callback receives bare child names, not full paths.
+			OpenFileInfo info(entry.name);
+			info.extended_info = MakeExtendedInfo(entry);
+			callback(info);
+			any = true;
 		}
-		OpenFileInfo info(name);
-		info.extended_info = MakeExtendedInfo(entries[i]);
-		callback(info);
 	}
-	if (entries) {
-		hdfs_bridge_free_dir_entries(entries, count);
-	}
-	return count > 0;
+	return any;
 }
 
 vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener) {

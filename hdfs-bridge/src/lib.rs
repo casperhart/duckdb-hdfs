@@ -449,33 +449,6 @@ fn statuses_to_entries(
     Box::into_raw(boxed) as *mut DirEntry
 }
 
-/// List the children of directory `path`. When `recursive` is true the whole
-/// subtree is walked. A null return with `status->code == HDFS_OK` means an
-/// empty directory. For large or recursive listings prefer the streaming API
-/// ([`hdfs_bridge_list_stream_open`]), which doesn't materialize the result
-/// and can parallelize the walk.
-#[no_mangle]
-pub unsafe extern "C" fn hdfs_bridge_list_status(
-    client: *mut BridgeClient,
-    path: *const c_char,
-    recursive: bool,
-    out_count: *mut i32,
-    status: *mut Status,
-) -> *mut DirEntry {
-    let client = unsafe { &*client };
-    let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.list_status(&path, recursive) {
-        Ok(statuses) => statuses_to_entries(statuses, out_count),
-        Err(e) => {
-            unsafe {
-                *out_count = 0;
-                set_error(status, format_args!("list '{path}' failed"), &e);
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
 // --- streaming listing -------------------------------------------------------
 
 /// Start a streaming listing of `path`. When `recursive` is true the whole

@@ -291,6 +291,36 @@ SELECT count(*), sum(n) FROM read_csv('hdfs://localhost:9000/test/nested/big.csv
 ----
 1000	499500
 
+# A partitioned write makes DuckDB core list the target directory — the
+# FileSystem ListFiles/ListFilesExtended path, which nothing above exercises
+# (hdfs_ls has its own route into the bridge).
+statement ok
+COPY (SELECT range % 2 AS p, range AS v FROM range(10))
+TO 'hdfs://localhost:9000/test/nested/part' (FORMAT parquet, PARTITION_BY (p));
+
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/test/nested/part') ORDER BY name;
+----
+p=0	directory
+p=1	directory
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/nested/part/*/*.parquet');
+----
+10
+
+# Rewriting is refused because the listing finds the existing partitions...
+statement error
+COPY (SELECT range % 2 AS p, range AS v FROM range(10))
+TO 'hdfs://localhost:9000/test/nested/part' (FORMAT parquet, PARTITION_BY (p));
+----
+not empty
+
+# ...unless overwriting is requested.
+statement ok
+COPY (SELECT range % 2 AS p, range AS v FROM range(10))
+TO 'hdfs://localhost:9000/test/nested/part' (FORMAT parquet, PARTITION_BY (p), OVERWRITE_OR_IGNORE);
+
 # --- error handling ----------------------------------------------------------
 
 # Opening a non-existent file surfaces a clear IO error.

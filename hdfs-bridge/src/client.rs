@@ -132,13 +132,6 @@ impl BridgeClient {
         })
     }
 
-    /// Children of directory `path`, the whole subtree when `recursive`. For
-    /// large or recursive listings prefer [`BridgeClient::list_stream`], which
-    /// doesn't materialize the result and can parallelize the walk.
-    pub fn list_status(&self, path: &str, recursive: bool) -> Result<Vec<FileStatus>, HdfsError> {
-        self.block_on(self.inner.list_status(path, recursive))
-    }
-
     /// Start a streaming listing of `path`. When `recursive` is true the whole
     /// subtree is walked, with `max_parallelism` (clamped to at least 1)
     /// bounding the number of concurrent listing RPCs. Never fails; errors

@@ -189,19 +189,6 @@ int64_t hdfs_bridge_write(struct hdfs_writer_t *writer,
 int32_t hdfs_bridge_close_writer(struct hdfs_writer_t *writer, struct hdfs_status_t *status);
 
 /**
- * List the children of directory `path`. When `recursive` is true the whole
- * subtree is walked. A null return with `status->code == HDFS_OK` means an
- * empty directory. For large or recursive listings prefer the streaming API
- * ([`hdfs_bridge_list_stream_open`]), which doesn't materialize the result
- * and can parallelize the walk.
- */
-struct hdfs_dir_entry_t *hdfs_bridge_list_status(struct hdfs_client_t *client,
-                                                 const char *path,
-                                                 bool recursive,
-                                                 int32_t *out_count,
-                                                 struct hdfs_status_t *status);
-
-/**
  * Start a streaming listing of `path`. When `recursive` is true the whole
  * subtree is walked, with `max_parallelism` bounding the number of concurrent
  * listing RPCs (values <= 1 list one directory at a time). Opening never

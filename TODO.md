@@ -6,16 +6,7 @@ on cluster nodes where `HADOOP_CONF_DIR` / `HADOOP_USER_NAME` are already set
 for Hive/Spark/the HDFS CLI, so it "just works" — no DuckDB secrets
 integration.
 
-## 1. Unify `ListFilesExtended` onto the streaming listing
-
-`ListFilesExtended` (`src/hdfs_filesystem.cpp`) is the one listing path still
-using the materializing `hdfs_bridge_list_status`; everything else streams.
-Its callback interface is already incremental, so it can be driven from an
-`OpenListStream`, after which `hdfs_bridge_list_status` (and the recursive
-mode of `client.list_status`) can be deleted from the ABI. Likely leftover
-from before the streaming API existed.
-
-## 2. Make the file-handle → client lifetime explicit
+## 1. Make the file-handle → client lifetime explicit
 
 An `HdfsFileHandle` holds a raw `hdfs_reader_t*` but not the
 `shared_ptr<hdfs_client_t>` it was created from. If a connection-level retry
