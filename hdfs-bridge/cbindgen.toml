@@ -1,4 +1,4 @@
-# Configuration for generating ../src/include/hdfs_bridge.h from this crate's
+# Configuration for generating include/hdfs_bridge.h from this crate's
 # `#[no_mangle]` items (see build.rs). Editing the FFI surface in lib.rs
 # regenerates the header on the next cargo build, so the two can't drift.
 

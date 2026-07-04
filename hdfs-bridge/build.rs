@@ -1,14 +1,16 @@
-//! Regenerates `src/include/hdfs_bridge.h` (the C header the DuckDB extension
+//! Regenerates `include/hdfs_bridge.h` (the C header the DuckDB extension
 //! compiles against) from this crate's `#[no_mangle]` items, so the header can
 //! never drift from the Rust definitions. Configured by `cbindgen.toml`. The
 //! generated header is committed: the C++ build only reads it, and a stale
-//! checkout still compiles before cargo has run.
+//! checkout still compiles before cargo has run. It lives here rather than in
+//! `src/include` so the repo's clang-format checks (which sweep `src`) don't
+//! fight cbindgen's output style.
 
 use std::path::PathBuf;
 
 fn main() {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let header = crate_dir.join("../src/include/hdfs_bridge.h");
+    let header = crate_dir.join("include/hdfs_bridge.h");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     cbindgen::generate(&crate_dir)

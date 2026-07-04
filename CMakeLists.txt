@@ -12,6 +12,9 @@ set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
+# The cbindgen-generated C header for the Rust bridge lives with its crate
+# (outside src/ so the clang-format checks don't fight generated code).
+include_directories(hdfs-bridge/include)
 
 set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp)
 

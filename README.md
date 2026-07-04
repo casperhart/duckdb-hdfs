@@ -185,7 +185,7 @@ as `localhost` and setting `dfs.client.use.datanode.hostname=true` on the client
 - `src/` — DuckDB extension (C++): `hdfs_extension.cpp` registers the filesystem
   and settings; `hdfs_filesystem.cpp` implements the `FileSystem`;
   `hdfs_functions.cpp` implements the metadata SQL functions.
-- `src/include/hdfs_bridge.h` — C ABI exposed by the Rust bridge; generated
-  from the Rust definitions by cbindgen on `cargo build` (do not edit).
-- `hdfs-bridge/` — Rust staticlib wrapping `hdfs-native` behind that C ABI.
+- `hdfs-bridge/` — Rust staticlib wrapping `hdfs-native` behind a C ABI; its
+  header (`hdfs-bridge/include/hdfs_bridge.h`) is generated from the Rust
+  definitions by cbindgen on `cargo build` (do not edit).
 - `test/` — SQL tests, Docker cluster, and helper scripts.
