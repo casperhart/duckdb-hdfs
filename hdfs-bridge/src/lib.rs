@@ -1,10 +1,12 @@
 //! C FFI bridge exposing a blocking subset of the `hdfs-native` client to the
 //! DuckDB HDFS extension (C++).
 //!
-//! The bridge drives the *async* `hdfs-native` client on a Tokio runtime it
-//! owns, blocking at the FFI boundary (rather than using `hdfs_native::sync`,
-//! which hides its runtime). Owning the runtime lets the bridge run custom
-//! concurrent operations — notably the parallel streaming listing behind
+//! This file is only the C boundary: argument/result marshalling and error
+//! translation. The blocking wrappers around the async `hdfs-native` client
+//! live in the [`client`] module, which drives the client on a Tokio runtime
+//! it owns (rather than using `hdfs_native::sync`, which hides its runtime).
+//! Owning the runtime lets the bridge run custom concurrent operations —
+//! notably the parallel streaming listing behind
 //! [`hdfs_bridge_list_stream_open`].
 //!
 //! ## Conventions
@@ -22,70 +24,16 @@
 //! * All returned C strings / arrays are owned by the caller and must be freed
 //!   with the matching `hdfs_bridge_free_*` function.
 
-use std::collections::VecDeque;
+mod client;
+
+pub use client::{BridgeClient, BridgeListStream, BridgeReader, BridgeWriter};
+
 use std::ffi::{CStr, CString};
-use std::future::Future;
 use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
-use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt as _};
-use hdfs_native::client::FileStatus;
-use hdfs_native::file::{FileReader, FileWriter};
-use hdfs_native::{Client, ClientBuilder, HdfsError, WriteOptions};
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
-
-// The C++ filesystem issues concurrent positional reads against a single
-// `FileReader` (DuckDB's parquet reader reads ranges from multiple threads on
-// one handle). That is only sound if `FileReader` is `Sync`. Assert it at
-// compile time so an upstream change can't silently break the bridge.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    fn assert_send<T: Send>() {}
-    assert_send_sync::<FileReader>();
-    assert_send_sync::<Client>();
-    assert_send_sync::<BridgeClient>();
-    assert_send_sync::<BridgeReader>();
-    // Writers and list streams move between threads but are only used from one
-    // at a time.
-    assert_send::<BridgeWriter>();
-    assert_send::<BridgeListStream>();
-};
-
-// Opaque handle types behind the FFI pointers. Each pairs an async
-// `hdfs-native` object with the runtime that drives it; readers/writers hold
-// their own `Arc` so they stay usable even if the client is freed first.
-//
-// Field order matters: `inner` is declared before `rt` so the hdfs-native
-// object (whose `Drop` may use the runtime, e.g. a writer releasing its file
-// lease) is dropped while the runtime is still alive.
-
-/// An HDFS client plus the Tokio runtime all its operations run on.
-pub struct BridgeClient {
-    inner: Client,
-    rt: Arc<Runtime>,
-}
-
-impl BridgeClient {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        self.rt.block_on(future)
-    }
-}
-
-/// An open file reader; see [`BridgeClient`] for the runtime coupling.
-pub struct BridgeReader {
-    inner: FileReader,
-    rt: Arc<Runtime>,
-}
-
-/// An open file writer; see [`BridgeClient`] for the runtime coupling.
-pub struct BridgeWriter {
-    inner: FileWriter,
-    rt: Arc<Runtime>,
-}
+use hdfs_native::HdfsError;
 
 // Error categories shared with the C++ side. Keep in sync with
 // `hdfs_error_code_t` in `hdfs_bridge.h`.
@@ -247,34 +195,11 @@ pub unsafe extern "C" fn hdfs_bridge_connect(
     user: *const c_char,
     status: *mut Status,
 ) -> *mut BridgeClient {
-    let rt = match Runtime::new() {
-        Ok(rt) => Arc::new(rt),
-        Err(e) => {
-            unsafe {
-                set_status(
-                    status,
-                    classify_io(&e),
-                    format_args!("failed to start IO runtime: {e}"),
-                )
-            };
-            return ptr::null_mut();
-        }
-    };
-    // The client spawns its IO tasks on our runtime; a plain `build()` would
-    // lazily create a second, hidden runtime.
-    let mut builder = ClientBuilder::new().with_io_runtime(rt.handle().clone());
-    if let Some(url) = unsafe { opt_str(url) } {
-        builder = builder.with_url(url);
-    }
-    if let Some(dir) = unsafe { opt_str(config_dir) } {
-        builder = builder.with_config_dir(dir);
-    }
-    if let Some(user) = unsafe { opt_str(user) } {
-        builder = builder.with_user(user);
-    }
-
-    match builder.build() {
-        Ok(client) => Box::into_raw(Box::new(BridgeClient { inner: client, rt })),
+    let url = unsafe { opt_str(url) };
+    let config_dir = unsafe { opt_str(config_dir) };
+    let user = unsafe { opt_str(user) };
+    match BridgeClient::connect(url, config_dir, user) {
+        Ok(client) => Box::into_raw(Box::new(client)),
         Err(e) => {
             unsafe { set_error(status, "failed to connect to HDFS", &e) };
             ptr::null_mut()
@@ -302,7 +227,7 @@ pub unsafe extern "C" fn hdfs_bridge_get_file_info(
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.get_file_info(&path)) {
+    match client.get_file_info(&path) {
         Ok(info) => {
             unsafe {
                 (*out).length = info.length as i64;
@@ -328,11 +253,8 @@ pub unsafe extern "C" fn hdfs_bridge_open(
 ) -> *mut BridgeReader {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.read(&path)) {
-        Ok(reader) => Box::into_raw(Box::new(BridgeReader {
-            inner: reader,
-            rt: Arc::clone(&client.rt),
-        })),
+    match client.open(&path) {
+        Ok(reader) => Box::into_raw(Box::new(reader)),
         Err(e) => {
             unsafe { set_error(status, format_args!("open '{path}' for reading failed"), &e) };
             ptr::null_mut()
@@ -351,7 +273,7 @@ pub unsafe extern "C" fn hdfs_bridge_close_reader(reader: *mut BridgeReader) {
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_file_size(reader: *mut BridgeReader) -> i64 {
     let reader = unsafe { &*reader };
-    reader.inner.file_length() as i64
+    reader.file_length() as i64
 }
 
 /// Read exactly `len` bytes into `buf` starting at `offset`. The caller must
@@ -371,10 +293,7 @@ pub unsafe extern "C" fn hdfs_bridge_read_range(
     }
     let reader = unsafe { &*reader };
     let slice = unsafe { slice::from_raw_parts_mut(buf, len as usize) };
-    match reader
-        .rt
-        .block_on(reader.inner.read_range_buf(slice, offset as usize))
-    {
+    match reader.read_range_buf(slice, offset as usize) {
         Ok(()) => len,
         Err(e) => {
             unsafe { set_error(status, format_args!("read at offset {offset} failed"), &e) };
@@ -396,14 +315,8 @@ pub unsafe extern "C" fn hdfs_bridge_create(
 ) -> *mut BridgeWriter {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    let opts = WriteOptions::default()
-        .overwrite(overwrite)
-        .create_parent(true);
-    match client.block_on(client.inner.create(&path, opts)) {
-        Ok(writer) => Box::into_raw(Box::new(BridgeWriter {
-            inner: writer,
-            rt: Arc::clone(&client.rt),
-        })),
+    match client.create(&path, overwrite) {
+        Ok(writer) => Box::into_raw(Box::new(writer)),
         Err(e) => {
             unsafe {
                 set_error(
@@ -418,6 +331,7 @@ pub unsafe extern "C" fn hdfs_bridge_create(
 }
 
 /// Append `len` bytes from `buf` to the file. Returns bytes written, or -1.
+/// A success is always a full write of `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_write(
     writer: *mut BridgeWriter,
@@ -431,13 +345,8 @@ pub unsafe extern "C" fn hdfs_bridge_write(
     }
     let writer = unsafe { &mut *writer };
     let slice = unsafe { slice::from_raw_parts(buf, len as usize) };
-    // write_bytes loops until the whole buffer is written (or errors), so a
-    // success is always a full write of `len` bytes.
-    match writer
-        .rt
-        .block_on(writer.inner.write_bytes(Bytes::copy_from_slice(slice)))
-    {
-        Ok(_) => len,
+    match writer.write(slice) {
+        Ok(()) => len,
         Err(e) => {
             unsafe { set_error(status, "write failed", &e) };
             -1
@@ -456,8 +365,7 @@ pub unsafe extern "C" fn hdfs_bridge_close_writer(
         return 0;
     }
     let writer = unsafe { Box::from_raw(writer) };
-    let BridgeWriter { mut inner, rt } = *writer;
-    match rt.block_on(inner.close()) {
+    match writer.close() {
         Ok(()) => 0,
         Err(e) => {
             unsafe { set_error(status, "close writer failed", &e) };
@@ -532,7 +440,7 @@ pub unsafe extern "C" fn hdfs_bridge_glob(
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let pattern = unsafe { CStr::from_ptr(pattern) }.to_string_lossy();
-    match client.block_on(client.inner.glob_status(&pattern)) {
+    match client.glob_status(&pattern) {
         Ok(statuses) => statuses_to_entries(statuses, out_count),
         Err(e) => {
             unsafe {
@@ -559,7 +467,7 @@ pub unsafe extern "C" fn hdfs_bridge_list_status(
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.list_status(&path, recursive)) {
+    match client.list_status(&path, recursive) {
         Ok(statuses) => statuses_to_entries(statuses, out_count),
         Err(e) => {
             unsafe {
@@ -572,80 +480,6 @@ pub unsafe extern "C" fn hdfs_bridge_list_status(
 }
 
 // --- streaming listing -------------------------------------------------------
-
-/// Entries buffered between the walker task and the consumer before
-/// backpressure pauses the walk.
-const LIST_STREAM_BUFFER: usize = 8192;
-
-/// A streaming (optionally recursive, optionally parallel) directory listing.
-/// A background task on the client's runtime walks the tree and feeds entries
-/// through a bounded channel; `hdfs_bridge_list_stream_next` drains it in
-/// batches. Entries arrive in completion order, not DFS order.
-pub struct BridgeListStream {
-    rx: mpsc::Receiver<Result<FileStatus, HdfsError>>,
-    /// Taken (awaited) once the channel closes, to distinguish a completed
-    /// walk from a panicked one.
-    task: Option<tokio::task::JoinHandle<()>>,
-    rt: Arc<Runtime>,
-    /// The listed path, for error messages.
-    path: String,
-    /// An error received mid-batch; surfaced on the following `next` call.
-    pending_error: Option<HdfsError>,
-}
-
-impl Drop for BridgeListStream {
-    fn drop(&mut self) {
-        // Cancel an unfinished walk promptly instead of letting it fill the
-        // channel and stall until the runtime dies.
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-/// Walk `root`, sending each discovered entry over `tx`. Directories are
-/// listed from a flat work queue with up to `max_parallelism` listing RPCs in
-/// flight; subdirectories found by any listing are appended to the queue. (A
-/// scheduler loop rather than recursion, so poll depth stays constant no
-/// matter how deep the tree is.) Sending blocks once the channel is full,
-/// pausing the walk until the consumer catches up. Exits on the first error
-/// (forwarded to the consumer) or when the consumer drops the stream.
-async fn stream_walk(
-    client: Client,
-    root: String,
-    recursive: bool,
-    max_parallelism: usize,
-    tx: mpsc::Sender<Result<FileStatus, HdfsError>>,
-) {
-    let client = &client;
-    let mut pending = VecDeque::from([root]);
-    let mut in_flight = FuturesUnordered::new();
-    loop {
-        while in_flight.len() < max_parallelism {
-            match pending.pop_front() {
-                Some(path) => in_flight.push(async move { client.list_status(&path, false).await }),
-                None => break,
-            }
-        }
-        match in_flight.next().await {
-            Some(Ok(children)) => {
-                for child in children {
-                    if recursive && child.isdir {
-                        pending.push_back(child.path.clone());
-                    }
-                    if tx.send(Ok(child)).await.is_err() {
-                        return; // consumer dropped the stream
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-            None => return, // queue drained and nothing in flight: walk complete
-        }
-    }
-}
 
 /// Start a streaming listing of `path`. When `recursive` is true the whole
 /// subtree is walked, with `max_parallelism` bounding the number of concurrent
@@ -662,21 +496,8 @@ pub unsafe extern "C" fn hdfs_bridge_list_stream_open(
     let path = unsafe { CStr::from_ptr(path) }
         .to_string_lossy()
         .into_owned();
-    let (tx, rx) = mpsc::channel(LIST_STREAM_BUFFER);
-    let task = client.rt.spawn(stream_walk(
-        client.inner.clone(),
-        path.clone(),
-        recursive,
-        max_parallelism.max(1) as usize,
-        tx,
-    ));
-    Box::into_raw(Box::new(BridgeListStream {
-        rx,
-        task: Some(task),
-        rt: Arc::clone(&client.rt),
-        path,
-        pending_error: None,
-    }))
+    let stream = client.list_stream(path, recursive, max_parallelism.max(1) as usize);
+    Box::into_raw(Box::new(stream))
 }
 
 /// Fetch the next batch of entries (at most `max_entries`), blocking until at
@@ -692,49 +513,14 @@ pub unsafe extern "C" fn hdfs_bridge_list_stream_next(
 ) -> *mut DirEntry {
     let stream = unsafe { &mut *stream };
     unsafe { *out_count = 0 };
-    if let Some(e) = stream.pending_error.take() {
-        let path = &stream.path;
-        unsafe { set_error(status, format_args!("list '{path}' failed"), &e) };
-        return ptr::null_mut();
-    }
-    let first = match stream.rt.block_on(stream.rx.recv()) {
-        Some(Ok(entry)) => entry,
-        Some(Err(e)) => {
-            let path = &stream.path;
+    match stream.next_batch(max_entries.max(1) as usize) {
+        Ok(batch) => statuses_to_entries(batch, out_count),
+        Err(e) => {
+            let path = stream.path();
             unsafe { set_error(status, format_args!("list '{path}' failed"), &e) };
-            return ptr::null_mut();
-        }
-        None => {
-            // Channel closed: the walk finished — or its task died without
-            // reporting, which must not masquerade as a clean end of stream.
-            if let Some(task) = stream.task.take() {
-                if let Err(e) = stream.rt.block_on(task) {
-                    let path = &stream.path;
-                    unsafe {
-                        set_status(
-                            status,
-                            HDFS_ERR_IO,
-                            format_args!("list '{path}' failed: walker task died: {e}"),
-                        )
-                    };
-                }
-            }
-            return ptr::null_mut();
-        }
-    };
-    let mut batch = vec![first];
-    while batch.len() < max_entries.max(1) as usize {
-        match stream.rx.try_recv() {
-            Ok(Ok(entry)) => batch.push(entry),
-            Ok(Err(e)) => {
-                // Hand out what we have; surface the error on the next call.
-                stream.pending_error = Some(e);
-                break;
-            }
-            Err(_) => break, // channel empty or closed: the batch is done
+            ptr::null_mut()
         }
     }
-    statuses_to_entries(batch, out_count)
 }
 
 #[no_mangle]
@@ -772,7 +558,7 @@ pub unsafe extern "C" fn hdfs_bridge_stat(
 ) -> *mut DirEntry {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.get_file_info(&path)) {
+    match client.get_file_info(&path) {
         Ok(info) => {
             let boxed = vec![status_to_entry(info)].into_boxed_slice();
             Box::into_raw(boxed) as *mut DirEntry
@@ -795,7 +581,7 @@ pub unsafe extern "C" fn hdfs_bridge_mkdirs(
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.mkdirs(&path, 0o755, true)) {
+    match client.mkdirs(&path) {
         Ok(()) => 0,
         Err(e) => {
             unsafe { set_error(status, format_args!("mkdirs '{path}' failed"), &e) };
@@ -815,7 +601,7 @@ pub unsafe extern "C" fn hdfs_bridge_delete(
 ) -> i32 {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
-    match client.block_on(client.inner.delete(&path, recursive)) {
+    match client.delete(&path, recursive) {
         Ok(true) => 0,
         Ok(false) => {
             unsafe {
@@ -846,7 +632,7 @@ pub unsafe extern "C" fn hdfs_bridge_rename(
     let client = unsafe { &*client };
     let src = unsafe { CStr::from_ptr(src) }.to_string_lossy();
     let dst = unsafe { CStr::from_ptr(dst) }.to_string_lossy();
-    match client.block_on(client.inner.rename(&src, &dst, overwrite)) {
+    match client.rename(&src, &dst, overwrite) {
         Ok(()) => 0,
         Err(e) => {
             unsafe { set_error(status, format_args!("rename '{src}' -> '{dst}' failed"), &e) };
