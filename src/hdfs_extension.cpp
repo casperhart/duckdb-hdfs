@@ -30,8 +30,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto *hdfs_ptr = hdfs_fs.get();
 	fs.RegisterSubSystem(std::move(hdfs_fs));
 
-	// Register the HDFS metadata functions (hdfs_ls / hdfs_glob / hdfs_stat /
-	// hdfs_exists).
+	// Register the HDFS metadata functions (hdfs_ls / hdfs_stat / hdfs_exists).
 	RegisterHdfsFunctions(loader, hdfs_ptr);
 }
 

@@ -88,7 +88,7 @@ SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data*.csv');
 ----
 3
 
-# --- metadata functions: hdfs_ls / hdfs_glob / hdfs_stat / hdfs_exists --------
+# --- metadata functions: hdfs_ls / hdfs_stat / hdfs_exists --------------------
 # Run before any writes so /test holds exactly data.csv, data.parquet, nested/
 # (and nested/ holds more.parquet).
 
@@ -223,21 +223,6 @@ statement error
 SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/**/a/**');
 ----
 multiple '**'
-
-# hdfs_glob is the same walk with pattern semantics always on.
-query TT
-SELECT name, type FROM hdfs_glob('hdfs://localhost:9000/test/*') ORDER BY name;
-----
-data.csv	file
-data.parquet	file
-nested	directory
-
-# On a literal path, hdfs_glob returns the entry itself where hdfs_ls lists
-# a directory's children.
-query TT
-SELECT name, type FROM hdfs_glob('hdfs://localhost:9000/test/nested');
-----
-nested	directory
 
 # hdfs_stat returns exactly one row for a single path, file or directory.
 query TT

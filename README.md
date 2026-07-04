@@ -61,7 +61,7 @@ SELECT * FROM hdfs_stat('hdfs://namenode:8020/data');
 SELECT hdfs_exists('hdfs://namenode:8020/data/events');
 ```
 
-Columns for `hdfs_ls` / `hdfs_glob` / `hdfs_stat` (identical, so results
+Columns for `hdfs_ls` / `hdfs_stat` (identical, so results
 compose/`UNION`): `path` (full `hdfs://` URL), `name` (basename), `type`
 (`'file'`/`'directory'`), `size`, `owner`, `group`, `permissions` (symbolic
 `rwxr-xr-x`), `mode` (raw permission bits), `replication`, `block_size` (both
@@ -73,14 +73,14 @@ escapes, and `**` as a whole component matching zero or more levels (at most
 one per pattern) — extended with Hadoop-style `{a,b}` alternation, which may
 span `/` (`/data/{2024/12,2025/01}/*`). A path containing any of `* ? [ {`
 switches `hdfs_ls` to glob semantics: matched entries come back *as rows
-themselves* (like `ls -d`, or `hdfs_glob`), files and directories both, and a
-pattern matching nothing returns an empty result rather than an error. A path
-without wildcards keeps plain `ls` semantics: a directory lists its children.
-Unlike the shell, `*` also matches dot-prefixed names, and rows arrive in
-completion order — use `ORDER BY path` when order matters. `hdfs_glob` is the
-same walk with pattern semantics always on (a literal path returns its own
-entry instead of listing children). The same globber backs `read_parquet` /
-`read_csv` / `glob()` over `hdfs://`, so `**` works there too.
+themselves* (like `ls -d`), files and directories both, and a pattern
+matching nothing returns an empty result rather than an error. A path
+without wildcards keeps plain `ls` semantics: a directory lists its children
+(use `hdfs_stat` for a wildcard-free path's own entry). Unlike the shell,
+`*` also matches dot-prefixed names, and rows arrive in completion order —
+use `ORDER BY path` when order matters. The same globber backs
+`read_parquet` / `read_csv` / `glob()` over `hdfs://`, so `**` works there
+too.
 
 **Keeping it fast.** HDFS has no server-side glob RPC, so patterns expand
 client-side by walking the tree with one `getListing` per directory that can

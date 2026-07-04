@@ -19,7 +19,7 @@ class HdfsFileSystem;
 static constexpr uint64_t DEFAULT_HDFS_LIST_PARALLELISM = 16;
 
 // A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
-// hdfs_glob / hdfs_stat table functions. `url` carries the authority back
+// hdfs_stat table functions. `url` carries the authority back
 // (e.g. "hdfs://host:port/a/b"); `name` is the basename. `replication` and
 // `block_size` are -1 when not applicable (HDFS leaves them unset for
 // directories); `mtime`/`atime` are epoch milliseconds.
@@ -61,7 +61,7 @@ struct HdfsFileHandle : public FileHandle {
 	idx_t length = 0;
 };
 
-// A streaming listing or glob backing hdfs_ls / hdfs_glob: a background walk
+// A streaming listing or glob backing hdfs_ls: a background walk
 // in the bridge produces entries while Next() hands them out in batches, so
 // rows flow before a large tree is fully walked. Walks touching more than one
 // directory fan out up to `max_parallelism` concurrent listing RPCs and

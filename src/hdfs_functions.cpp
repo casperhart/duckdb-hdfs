@@ -13,10 +13,10 @@ namespace duckdb {
 
 namespace {
 
-// Which HDFS metadata call a hdfs_ls / hdfs_glob / hdfs_stat table function
-// invocation maps to. All three share one output schema and execution path;
-// only the backing RPC differs.
-enum class HdfsMetaOp { LIST, GLOB, STAT };
+// Which HDFS metadata call a hdfs_ls / hdfs_stat table function invocation
+// maps to. Both share one output schema and execution path; only the backing
+// RPC differs.
+enum class HdfsMetaOp { LIST, STAT };
 
 // Carries the borrowed filesystem and the operation into a table function's
 // bind, via TableFunction::function_info.
@@ -34,7 +34,7 @@ struct HdfsScalarFunctionInfo : public ScalarFunctionInfo {
 	HdfsFileSystem *hdfs;
 };
 
-// Column layout shared by hdfs_ls / hdfs_glob / hdfs_stat.
+// Column layout shared by hdfs_ls / hdfs_stat.
 enum ColumnIndex : idx_t {
 	COL_PATH = 0,
 	COL_NAME,
@@ -87,8 +87,8 @@ unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindI
 	return std::move(result);
 }
 
-// LIST and GLOB stream batches from a background walk as they arrive; STAT
-// runs its RPC once in Init and holds the resulting row.
+// LIST streams batches from a background walk as they arrive; STAT runs its
+// RPC once in Init and holds the resulting row.
 struct HdfsMetaGlobalState : public GlobalTableFunctionState {
 	unique_ptr<HdfsListStream> stream;
 	vector<HdfsEntry> entries;
@@ -123,11 +123,6 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context));
 		}
 		break;
-	case HdfsMetaOp::GLOB:
-		// Always pattern semantics: a literal path yields its own entry
-		// (where hdfs_ls would list a directory's children).
-		state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context));
-		break;
 	case HdfsMetaOp::STAT:
 		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path));
 		break;
@@ -138,7 +133,7 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<HdfsMetaGlobalState>();
 	// LIST pulls the next batch from the background walk (blocking until rows
-	// arrive or the walk ends); GLOB/STAT emit a slice of the materialized rows.
+	// arrive or the walk ends); STAT emits a slice of the materialized rows.
 	vector<HdfsEntry> batch;
 	const HdfsEntry *rows;
 	idx_t count;
@@ -215,11 +210,6 @@ void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
 	auto ls = MakeMetaFunction("hdfs_ls");
 	ls.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::LIST);
 	loader.RegisterFunction(ls);
-
-	// hdfs_glob(pattern)
-	auto glob = MakeMetaFunction("hdfs_glob");
-	glob.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::GLOB);
-	loader.RegisterFunction(glob);
 
 	// hdfs_stat(path)
 	auto stat = MakeMetaFunction("hdfs_stat");
