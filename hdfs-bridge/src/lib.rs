@@ -37,25 +37,41 @@ use std::slice;
 
 use hdfs_native::HdfsError;
 
-// Error categories shared with the C++ side. Keep in sync with
-// `hdfs_error_code_t` in `hdfs_bridge.h`.
-#[allow(dead_code)] // success leaves status untouched; kept for parity with the header
-const HDFS_OK: i32 = 0;
-const HDFS_ERR_IO: i32 = 1;
-const HDFS_ERR_NOT_FOUND: i32 = 2;
-const HDFS_ERR_PERMISSION: i32 = 3;
-const HDFS_ERR_ALREADY_EXISTS: i32 = 4;
-const HDFS_ERR_CONNECTION: i32 = 5;
-const HDFS_ERR_INVALID_ARGUMENT: i32 = 6;
+// Error categories carried across the FFI boundary in `Status::code`. The
+// bridge classifies the underlying `hdfs_native::HdfsError` into one of these
+// so the C++ side can act on the *kind* of failure (e.g. treat "not found"
+// differently from "the cluster is unreachable") instead of pattern-matching
+// on message strings.
+/// No error; `Status` is left untouched on success, so this is only ever the
+/// value the caller initialized it to.
+#[allow(dead_code)]
+pub const HDFS_OK: i32 = 0;
+/// Generic I/O / RPC failure.
+pub const HDFS_ERR_IO: i32 = 1;
+/// Path does not exist.
+pub const HDFS_ERR_NOT_FOUND: i32 = 2;
+/// Access denied.
+pub const HDFS_ERR_PERMISSION: i32 = 3;
+/// Path already exists.
+pub const HDFS_ERR_ALREADY_EXISTS: i32 = 4;
+/// Connect/RPC/SASL failure; the client may be stale.
+pub const HDFS_ERR_CONNECTION: i32 = 5;
+/// Bad path / argument.
+pub const HDFS_ERR_INVALID_ARGUMENT: i32 = 6;
 
-/// FFI result struct, mirrored by `hdfs_status_t` in `hdfs_bridge.h`.
+/// Result of a fallible call. On success `code == HDFS_OK` and `msg == NULL`.
+/// On failure `code` is the category and `msg` is an owned, NUL-terminated
+/// message that the caller must free with `hdfs_bridge_free_string`. Callers
+/// must initialize the struct to `{HDFS_OK, NULL}` before each call; the
+/// bridge only writes it on failure.
 #[repr(C)]
 pub struct Status {
+    /// One of the `HDFS_OK` / `HDFS_ERR_*` categories.
     pub code: i32,
     pub msg: *mut c_char,
 }
 
-/// Information about a single file or directory, mirrored in `hdfs_bridge.h`.
+/// Metadata for a single path. `mtime` is epoch milliseconds.
 #[repr(C)]
 pub struct FileInfo {
     pub length: i64,
@@ -63,10 +79,11 @@ pub struct FileInfo {
     pub mtime: u64,
 }
 
-/// One entry in a directory listing or glob result, mirrored in
-/// `hdfs_bridge.h`. `path`, `owner` and `group` are owned C strings.
-/// `replication` and `block_size` use `-1` to mean "not applicable" (HDFS
-/// leaves them unset for directories).
+/// One entry in a listing/glob result. `path`, `owner` and `group` are owned
+/// C strings (`path` is scheme-less, e.g. "/a/b"); free the whole entry with
+/// `hdfs_bridge_free_dir_entries`. `replication` and `block_size` are `-1`
+/// when not applicable (HDFS leaves them unset for directories);
+/// `mtime`/`atime` are epoch milliseconds.
 #[repr(C)]
 pub struct DirEntry {
     pub path: *mut c_char,
@@ -280,7 +297,8 @@ pub unsafe extern "C" fn hdfs_bridge_file_size(reader: *mut BridgeReader) -> i64
 
 /// Read exactly `len` bytes into `buf` starting at `offset`. The caller must
 /// ensure `offset + len <= file_size`. Returns the number of bytes read
-/// (`len`) on success, or -1 on error. Thread-safe: takes `&self`.
+/// (`len`) on success, or -1 on error. Thread-safe across concurrent calls on
+/// the same reader.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_read_range(
     reader: *mut BridgeReader,

@@ -6,17 +6,7 @@ on cluster nodes where `HADOOP_CONF_DIR` / `HADOOP_USER_NAME` are already set
 for Hive/Spark/the HDFS CLI, so it "just works" — no DuckDB secrets
 integration.
 
-## 1. Generate `hdfs_bridge.h` with cbindgen
-
-Three definitions are hand-mirrored between `src/include/hdfs_bridge.h` and
-`hdfs-bridge/src/lib.rs`, guarded only by "keep in sync" comments:
-`hdfs_error_code_t` / the Rust constants, `hdfs_status_t` / `Status`, and
-`hdfs_dir_entry_t` / `DirEntry`. Generating the header from `lib.rs` with
-cbindgen (Corrosion can run it as a build step) turns a drifted struct into a
-build failure instead of memory corruption. cbindgen carries Rust doc comments
-through, so the header docs survive.
-
-## 2. Unify `ListFilesExtended` onto the streaming listing
+## 1. Unify `ListFilesExtended` onto the streaming listing
 
 `ListFilesExtended` (`src/hdfs_filesystem.cpp`) is the one listing path still
 using the materializing `hdfs_bridge_list_status`; everything else streams.
@@ -25,7 +15,7 @@ Its callback interface is already incremental, so it can be driven from an
 mode of `client.list_status`) can be deleted from the ABI. Likely leftover
 from before the streaming API existed.
 
-## 3. Make the file-handle → client lifetime explicit
+## 2. Make the file-handle → client lifetime explicit
 
 An `HdfsFileHandle` holds a raw `hdfs_reader_t*` but not the
 `shared_ptr<hdfs_client_t>` it was created from. If a connection-level retry
