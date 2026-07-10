@@ -11,7 +11,6 @@
 //! an object whose `Drop` needs it (e.g. a writer releasing its file lease)
 //! can never outlive it, whatever the drop order.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -278,7 +277,9 @@ pub struct WalkOptions {
 /// A streaming (optionally recursive, optionally parallel) directory listing.
 /// A background task on the client's runtime walks the tree and feeds entries
 /// through a bounded channel; [`BridgeListStream::next_batch`] drains it in
-/// batches. Entries arrive in completion order, not DFS order.
+/// batches. Entries arrive in completion order (the walk schedules
+/// depth-first, but parallel RPCs finish out of order), so no path order is
+/// guaranteed.
 pub struct BridgeListStream {
     rx: mpsc::Receiver<Result<FileStatus, HdfsError>>,
     /// Taken (awaited) once the channel closes, to distinguish a completed
@@ -349,16 +350,20 @@ impl BridgeListStream {
 }
 
 /// Walk `root`, sending each discovered entry over `tx`. Directories are
-/// listed from a flat work queue with up to `max_parallelism` listing RPCs in
-/// flight; subdirectories found by any listing are appended to the queue. (A
-/// scheduler loop rather than recursion, so poll depth stays constant no
-/// matter how deep the tree is.) Sending blocks once the channel is full,
+/// listed from a flat LIFO work stack with up to `max_parallelism` listing
+/// RPCs in flight; subdirectories found by any listing are pushed onto the
+/// stack. (A scheduler loop rather than recursion, so poll depth stays
+/// constant no matter how deep the tree is.) LIFO makes the walk
+/// depth-first-ish: the freshest discovery is listed next, keeping the gap
+/// between listing a parent and listing its children small — which both
+/// shrinks the window for a concurrent delete (Spark removing `_temporary`)
+/// to strand queued children and bounds the stack by depth x fan-out rather
+/// than the tree's widest level. Sending blocks once the channel is full,
 /// pausing the walk until the consumer catches up. Exits on the first
 /// non-pruned error (forwarded to the consumer) or when the consumer drops
 /// the stream. Below the root, a subdirectory that vanished since its parent
-/// was listed (a concurrent delete, e.g. Spark removing `_temporary`) is
-/// pruned rather than an error, as is — with `skip_permission_errors` — one
-/// the caller may not list.
+/// was listed is pruned rather than an error, as is — with
+/// `skip_permission_errors` — one the caller may not list.
 async fn stream_walk(
     client: Client,
     root: String,
@@ -368,11 +373,11 @@ async fn stream_walk(
     tx: mpsc::Sender<Result<FileStatus, HdfsError>>,
 ) {
     let client = &client;
-    let mut pending = VecDeque::from([(root, true)]);
+    let mut pending = vec![(root, true)];
     let mut in_flight = FuturesUnordered::new();
     loop {
         while in_flight.len() < max_parallelism {
-            match pending.pop_front() {
+            match pending.pop() {
                 Some((path, is_root)) => in_flight.push(async move {
                     let listing = client.list_status(&path, false).await;
                     (path, is_root, listing)
@@ -397,7 +402,7 @@ async fn stream_walk(
                         }
                     }
                     if recursive && child.isdir {
-                        pending.push_back((child.path.clone(), false));
+                        pending.push((child.path.clone(), false));
                     }
                     if tx.send(Ok(child)).await.is_err() {
                         return; // consumer dropped the stream
@@ -419,8 +424,9 @@ async fn stream_walk(
 }
 
 /// Walk the tree from `plan`'s literal root, sending every entry matching the
-/// glob over `tx`. Same scheduling as [`stream_walk`] (flat work queue, up to
-/// `max_parallelism` listing RPCs in flight, backpressure via the channel),
+/// glob over `tx`. Same scheduling as [`stream_walk`] (flat LIFO work stack,
+/// up to `max_parallelism` listing RPCs in flight, backpressure via the
+/// channel),
 /// but each queued directory carries its NFA states and children are filtered
 /// through [`GlobPlan::step`], which prunes descent to directories that can
 /// still match (and applies the hidden-entry rules). Missing paths are pruned
@@ -451,14 +457,14 @@ async fn glob_walk(
             }
         }
     }
-    let mut pending: VecDeque<(String, Vec<Pos>, bool)> = VecDeque::new();
+    let mut pending: Vec<(String, Vec<Pos>, bool)> = Vec::new();
     if !plan.initial().is_empty() {
-        pending.push_back((plan.root().to_string(), plan.initial().to_vec(), true));
+        pending.push((plan.root().to_string(), plan.initial().to_vec(), true));
     }
     let mut in_flight = FuturesUnordered::new();
     loop {
         while in_flight.len() < max_parallelism {
-            match pending.pop_front() {
+            match pending.pop() {
                 Some((path, states, is_root)) => in_flight.push(async move {
                     let listing = client.list_status(&path, false).await;
                     (path, states, is_root, listing)
@@ -481,7 +487,7 @@ async fn glob_walk(
                         .unwrap_or(child.path.as_str());
                     let step = plan.step(&states, name, child.isdir);
                     if child.isdir && !step.next.is_empty() {
-                        pending.push_back((child.path.clone(), step.next, false));
+                        pending.push((child.path.clone(), step.next, false));
                     }
                     if step.emit && tx.send(Ok(child)).await.is_err() {
                         return; // consumer dropped the stream

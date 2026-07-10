@@ -54,7 +54,9 @@ typedef struct hdfs_client_t hdfs_client_t;
  * A streaming (optionally recursive, optionally parallel) directory listing.
  * A background task on the client's runtime walks the tree and feeds entries
  * through a bounded channel; [`BridgeListStream::next_batch`] drains it in
- * batches. Entries arrive in completion order, not DFS order.
+ * batches. Entries arrive in completion order (the walk schedules
+ * depth-first, but parallel RPCs finish out of order), so no path order is
+ * guaranteed.
  */
 typedef struct hdfs_list_stream_t hdfs_list_stream_t;
 
