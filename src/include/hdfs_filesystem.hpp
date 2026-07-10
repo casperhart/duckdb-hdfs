@@ -18,6 +18,20 @@ class HdfsFileSystem;
 // hdfs_extension.cpp); also the fallback when no setting context is available.
 static constexpr uint64_t DEFAULT_HDFS_LIST_PARALLELISM = 16;
 
+// Per-walk behavior toggles for listings and globs; the defaults mirror the
+// hdfs_skip_permission_errors / hdfs_include_hidden settings' defaults.
+struct HdfsWalkOptions {
+	// Prune subtrees whose listing fails with a permission error instead of
+	// failing the walk. Only applies below the walk root: an error on the
+	// path/pattern-root the caller named always surfaces.
+	bool skip_permission_errors = false;
+	// Return entries whose name starts with '.' or '_' (Hadoop's hidden
+	// convention). When false, hidden entries are neither returned nor
+	// descended into, except where a glob component names them explicitly
+	// (e.g. '_temporary' or '_*') or the entry is itself the listed path.
+	bool include_hidden = false;
+};
+
 // A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
 // hdfs_stat table functions. `url` carries the authority back
 // (e.g. "hdfs://host:port/a/b"); `name` is the basename. `replication` and
@@ -98,6 +112,7 @@ private:
 	string hdfs_path; // scheme-less path (a pattern when `glob`)
 	bool glob = false;
 	int32_t max_parallelism = 1;
+	HdfsWalkOptions options;
 	HdfsConnection *conn = nullptr; // owned by the filesystem, which outlives us
 	std::shared_ptr<hdfs_client_t> client;
 	hdfs_list_stream_t *handle = nullptr;
@@ -156,9 +171,13 @@ public:
 	// Stat: metadata for a single `url` (file or directory).
 	//
 	// `max_parallelism` bounds the concurrent listing RPCs of walks that touch
-	// more than one directory (the hdfs_list_parallelism setting).
-	unique_ptr<HdfsListStream> OpenListStream(const string &url, int32_t max_parallelism = 1);
-	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, int32_t max_parallelism = 1);
+	// more than one directory (the hdfs_list_parallelism setting); `options`
+	// carries the hidden-entry and permission-error behavior (see
+	// HdfsWalkOptions).
+	unique_ptr<HdfsListStream> OpenListStream(const string &url, int32_t max_parallelism = 1,
+	                                          HdfsWalkOptions options = {});
+	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, int32_t max_parallelism = 1,
+	                                          HdfsWalkOptions options = {});
 	HdfsEntry Stat(const string &url);
 	// True if `url` exists (file or directory); a single stat RPC.
 	bool Exists(const string &url);

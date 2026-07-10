@@ -1,0 +1,66 @@
+# name: test/sql/hdfs_permissions.test
+# description: Permission-error handling against a real HDFS, as a non-superuser.
+# group: [sql]
+
+#
+# Run via test/scripts/run_hdfs_tests.sh, which invokes this file with
+# HADOOP_USER_NAME=guest — a plain user, unlike the main suite's superuser.
+# That matters: the HDFS superuser bypasses permission checks entirely, so it
+# can never see an AccessControlException. Fixtures (seeded by hdfs_up.sh):
+# /permtest/open (world-listable, holds a.csv) and /permtest/locked
+# (chmod 700, superuser-owned, holds b.csv).
+
+require hdfs
+
+require-env HDFS_TEST_RUNNING
+
+# A walk that descends into a forbidden directory fails the query by default.
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/**');
+----
+Permission denied
+
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/permtest/**/*.csv');
+----
+Permission denied
+
+# Opting in prunes the forbidden subtree and keeps everything readable. The
+# locked directory itself still appears: its name comes from the parent's
+# (permitted) listing; only its contents are unknown.
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/permtest/**', skip_permission_errors := true) ORDER BY name;
+----
+a.csv	file
+locked	directory
+open	directory
+
+# The hdfs_skip_permission_errors setting covers scans (and hdfs_ls calls
+# without the parameter), which take no per-call parameter.
+statement ok
+SET hdfs_skip_permission_errors = true;
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/permtest/**/*.csv');
+----
+3
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/permtest/**');
+----
+1
+
+statement ok
+RESET hdfs_skip_permission_errors;
+
+# The listed path / glob root stays strict: being unable to see the tree at
+# all is an error, not an empty result, even with skipping enabled.
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked', skip_permission_errors := true);
+----
+Permission denied
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked/**', skip_permission_errors := true);
+----
+Permission denied

@@ -256,6 +256,102 @@ SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/does
 ----
 0
 
+# --- hidden entries (/hidtest fixtures) ---------------------------------------
+# Names starting with '_' or '.' (Hadoop's hidden convention) are excluded from
+# listings, globs and scans by default: neither returned nor descended into.
+
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/hidtest') ORDER BY name;
+----
+nested	directory
+visible.csv	file
+
+# include_hidden := true restores them per call...
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/hidtest', include_hidden := true) ORDER BY name;
+----
+.staged.csv	file
+_temporary	directory
+nested	directory
+visible.csv	file
+
+# ...and a '**' crawl neither returns hidden entries nor walks into hidden
+# directories (part-0001.csv inside _temporary stays invisible).
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/**') ORDER BY name;
+----
+more.csv
+nested
+visible.csv
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/**', include_hidden := true) ORDER BY name;
+----
+.staged.csv
+_SUCCESS
+_temporary
+more.csv
+nested
+part-0001.csv
+visible.csv
+
+# Naming the hidden entry explicitly overrides the default (like the shell):
+# a literal path, a pattern whose first character is the hidden one, or a
+# literal component after a '**'.
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/_temporary') ORDER BY name;
+----
+part-0001.csv
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/_*') ORDER BY name;
+----
+_temporary
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/**/_SUCCESS') ORDER BY name;
+----
+_SUCCESS
+
+query T
+SELECT name FROM hdfs_ls('hdfs://localhost:9000/hidtest/.staged.csv');
+----
+.staged.csv
+
+# hdfs_stat addresses one path directly and is unaffected.
+query TT
+SELECT name, type FROM hdfs_stat('hdfs://localhost:9000/hidtest/.staged.csv');
+----
+.staged.csv	file
+
+# Scans follow the same rule; the hdfs_include_hidden setting also covers
+# read_csv / read_parquet / glob(), which take no per-call parameter.
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/hidtest/**/*.csv');
+----
+6
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/hidtest/**');
+----
+2
+
+statement ok
+SET hdfs_include_hidden = true;
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/hidtest/**/*.csv');
+----
+12
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/hidtest/**');
+----
+5
+
+statement ok
+RESET hdfs_include_hidden;
+
 # --- writing (COPY TO) then reading back -------------------------------------
 # Writes go under nested/ so they can't perturb the /test/*.{csv,parquet} globs.
 

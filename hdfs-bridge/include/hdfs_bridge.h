@@ -193,11 +193,18 @@ int32_t hdfs_bridge_close_writer(struct hdfs_writer_t *writer, struct hdfs_statu
  * subtree is walked, with `max_parallelism` bounding the number of concurrent
  * listing RPCs (values <= 1 list one directory at a time). Opening never
  * fails; errors (including not-found) surface on the first `next` call.
+ * Unless `include_hidden`, entries named with a leading `.` or `_` are
+ * neither returned nor descended into (`path` itself is exempt). With
+ * `skip_permission_errors`, subtrees below `path` the caller may not list
+ * are pruned instead of failing the walk; errors on `path` itself always
+ * surface.
  */
 struct hdfs_list_stream_t *hdfs_bridge_list_stream_open(struct hdfs_client_t *client,
                                                         const char *path,
                                                         bool recursive,
-                                                        int32_t max_parallelism);
+                                                        int32_t max_parallelism,
+                                                        bool skip_permission_errors,
+                                                        bool include_hidden);
 
 /**
  * Start a streaming glob of `pattern`: matched entries — files and
@@ -207,10 +214,17 @@ struct hdfs_list_stream_t *hdfs_bridge_list_stream_open(struct hdfs_client_t *cl
  * `max_parallelism` bounds the number of concurrent listing RPCs. Returns
  * null with a non-OK status for an invalid pattern; a pattern matching
  * nothing yields an empty stream, and other errors surface on `next`.
+ * Unless `include_hidden`, names with a leading `.` or `_` only match
+ * components that spell that character out literally (`_temporary`, `_*`),
+ * and `**` never matches or descends into them. With
+ * `skip_permission_errors`, directories below the pattern's literal root the
+ * caller may not list are pruned instead of failing the walk.
  */
 struct hdfs_list_stream_t *hdfs_bridge_glob_stream_open(struct hdfs_client_t *client,
                                                         const char *pattern,
                                                         int32_t max_parallelism,
+                                                        bool skip_permission_errors,
+                                                        bool include_hidden,
                                                         struct hdfs_status_t *status);
 
 /**

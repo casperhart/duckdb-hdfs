@@ -23,7 +23,7 @@ use hdfs_native::{Client, ClientBuilder, HdfsError, WriteOptions};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
-use crate::glob::{GlobPlan, Pos};
+use crate::glob::{self, GlobPlan, Pos};
 
 // The C++ filesystem issues concurrent positional reads against a single
 // `FileReader` (DuckDB's parquet reader reads ranges from multiple threads on
@@ -135,12 +135,16 @@ impl BridgeClient {
     /// Start a streaming listing of `path`. When `recursive` is true the whole
     /// subtree is walked, with `max_parallelism` (clamped to at least 1)
     /// bounding the number of concurrent listing RPCs. Never fails; errors
-    /// (including not-found) surface on the first `next_batch` call.
+    /// (including not-found) surface on the first `next_batch` call — except
+    /// for subdirectories pruned per `options`. The path itself is taken as
+    /// explicitly named: errors on it always surface, and it is never
+    /// hidden-filtered.
     pub fn list_stream(
         &self,
         path: String,
         recursive: bool,
         max_parallelism: usize,
+        options: WalkOptions,
     ) -> BridgeListStream {
         let (tx, rx) = mpsc::channel(LIST_STREAM_BUFFER);
         let task = self.rt.spawn(stream_walk(
@@ -148,6 +152,7 @@ impl BridgeClient {
             path.clone(),
             recursive,
             max_parallelism.max(1),
+            options,
             tx,
         ));
         BridgeListStream {
@@ -160,21 +165,25 @@ impl BridgeClient {
     }
 
     /// Start a streaming glob of `pattern` (see the [`crate::glob`] module for
-    /// the supported syntax), returning matched entries — files and
-    /// directories — themselves. `max_parallelism` (clamped to at least 1)
-    /// bounds the number of concurrent listing RPCs. Fails only on an invalid
-    /// pattern; a pattern matching nothing yields an empty stream.
+    /// the supported syntax and the hidden-entry rules), returning matched
+    /// entries — files and directories — themselves. `max_parallelism`
+    /// (clamped to at least 1) bounds the number of concurrent listing RPCs.
+    /// Fails only on an invalid pattern; a pattern matching nothing yields an
+    /// empty stream. Permission errors below the pattern's literal root are
+    /// pruned per `options`; on the root itself they always surface.
     pub fn glob_stream(
         &self,
         pattern: String,
         max_parallelism: usize,
+        options: WalkOptions,
     ) -> Result<BridgeListStream, HdfsError> {
-        let plan = GlobPlan::parse(&pattern)?;
+        let plan = GlobPlan::parse(&pattern, options.include_hidden)?;
         let (tx, rx) = mpsc::channel(LIST_STREAM_BUFFER);
         let task = self.rt.spawn(glob_walk(
             self.inner.clone(),
             plan,
             max_parallelism.max(1),
+            options,
             tx,
         ));
         Ok(BridgeListStream {
@@ -249,6 +258,22 @@ impl BridgeWriter {
 /// Entries buffered between the walker task and the consumer before
 /// backpressure pauses the walk.
 const LIST_STREAM_BUFFER: usize = 8192;
+
+/// Per-walk behavior toggles shared by listings and globs.
+#[derive(Clone, Copy)]
+pub struct WalkOptions {
+    /// Prune subtrees whose listing fails with a permission error instead of
+    /// failing the walk. Only applies below the walk root: an error on the
+    /// path/pattern-root the caller named always surfaces, so a misconfigured
+    /// principal can't masquerade as an empty result. All other error classes
+    /// (connection, SASL, IO) always fail the walk.
+    pub skip_permission_errors: bool,
+    /// Return entries whose name starts with `.` or `_` (Hadoop's hidden
+    /// convention). When false, hidden entries are neither returned nor
+    /// descended into, except where a glob component names them explicitly
+    /// (see [`crate::glob`]).
+    pub include_hidden: bool,
+}
 
 /// A streaming (optionally recursive, optionally parallel) directory listing.
 /// A background task on the client's runtime walks the tree and feeds entries
@@ -328,39 +353,65 @@ impl BridgeListStream {
 /// flight; subdirectories found by any listing are appended to the queue. (A
 /// scheduler loop rather than recursion, so poll depth stays constant no
 /// matter how deep the tree is.) Sending blocks once the channel is full,
-/// pausing the walk until the consumer catches up. Exits on the first error
-/// (forwarded to the consumer) or when the consumer drops the stream.
+/// pausing the walk until the consumer catches up. Exits on the first
+/// non-pruned error (forwarded to the consumer) or when the consumer drops
+/// the stream. Below the root, a subdirectory that vanished since its parent
+/// was listed (a concurrent delete, e.g. Spark removing `_temporary`) is
+/// pruned rather than an error, as is — with `skip_permission_errors` — one
+/// the caller may not list.
 async fn stream_walk(
     client: Client,
     root: String,
     recursive: bool,
     max_parallelism: usize,
+    options: WalkOptions,
     tx: mpsc::Sender<Result<FileStatus, HdfsError>>,
 ) {
     let client = &client;
-    let mut pending = VecDeque::from([root]);
+    let mut pending = VecDeque::from([(root, true)]);
     let mut in_flight = FuturesUnordered::new();
     loop {
         while in_flight.len() < max_parallelism {
             match pending.pop_front() {
-                Some(path) => in_flight.push(async move { client.list_status(&path, false).await }),
+                Some((path, is_root)) => in_flight.push(async move {
+                    let listing = client.list_status(&path, false).await;
+                    (path, is_root, listing)
+                }),
                 None => break,
             }
         }
         match in_flight.next().await {
-            Some(Ok(children)) => {
+            Some((path, _, Ok(children))) => {
                 for child in children {
+                    // Hidden filtering exempts `child.path == path` (listing a
+                    // file returns the file itself): the caller named that
+                    // path explicitly.
+                    if !options.include_hidden && child.path != path {
+                        let name = child
+                            .path
+                            .rsplit_once('/')
+                            .map(|(_, n)| n)
+                            .unwrap_or(child.path.as_str());
+                        if glob::is_hidden(name) {
+                            continue;
+                        }
+                    }
                     if recursive && child.isdir {
-                        pending.push_back(child.path.clone());
+                        pending.push_back((child.path.clone(), false));
                     }
                     if tx.send(Ok(child)).await.is_err() {
                         return; // consumer dropped the stream
                     }
                 }
             }
-            Some(Err(e)) => {
-                let _ = tx.send(Err(e)).await;
-                return;
+            Some((_, is_root, Err(e))) => {
+                let prune = !is_root
+                    && (matches!(e, HdfsError::FileNotFound(_))
+                        || (options.skip_permission_errors && crate::is_permission(&e)));
+                if !prune {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
             None => return, // queue drained and nothing in flight: walk complete
         }
@@ -372,12 +423,16 @@ async fn stream_walk(
 /// `max_parallelism` listing RPCs in flight, backpressure via the channel),
 /// but each queued directory carries its NFA states and children are filtered
 /// through [`GlobPlan::step`], which prunes descent to directories that can
-/// still match. Missing paths are pruned silently (a glob matching nothing is
-/// not an error); any other error is forwarded and ends the walk.
+/// still match (and applies the hidden-entry rules). Missing paths are pruned
+/// silently (a glob matching nothing is not an error), and so — with
+/// `skip_permission_errors`, below the pattern's literal root — are
+/// directories the caller may not list; any other error is forwarded and ends
+/// the walk.
 async fn glob_walk(
     client: Client,
     plan: GlobPlan,
     max_parallelism: usize,
+    options: WalkOptions,
     tx: mpsc::Sender<Result<FileStatus, HdfsError>>,
 ) {
     let client = &client;
@@ -396,23 +451,23 @@ async fn glob_walk(
             }
         }
     }
-    let mut pending: VecDeque<(String, Vec<Pos>)> = VecDeque::new();
+    let mut pending: VecDeque<(String, Vec<Pos>, bool)> = VecDeque::new();
     if !plan.initial().is_empty() {
-        pending.push_back((plan.root().to_string(), plan.initial().to_vec()));
+        pending.push_back((plan.root().to_string(), plan.initial().to_vec(), true));
     }
     let mut in_flight = FuturesUnordered::new();
     loop {
         while in_flight.len() < max_parallelism {
             match pending.pop_front() {
-                Some((path, states)) => in_flight.push(async move {
+                Some((path, states, is_root)) => in_flight.push(async move {
                     let listing = client.list_status(&path, false).await;
-                    (path, states, listing)
+                    (path, states, is_root, listing)
                 }),
                 None => break,
             }
         }
         match in_flight.next().await {
-            Some((path, states, Ok(children))) => {
+            Some((path, states, _, Ok(children))) => {
                 for child in children {
                     // Listing a file returns the file itself; it has no
                     // children to match.
@@ -426,7 +481,7 @@ async fn glob_walk(
                         .unwrap_or(child.path.as_str());
                     let step = plan.step(&states, name, child.isdir);
                     if child.isdir && !step.next.is_empty() {
-                        pending.push_back((child.path.clone(), step.next));
+                        pending.push_back((child.path.clone(), step.next, false));
                     }
                     if step.emit && tx.send(Ok(child)).await.is_err() {
                         return; // consumer dropped the stream
@@ -435,8 +490,11 @@ async fn glob_walk(
             }
             // The root (or, in a race, a directory found earlier) is gone:
             // that's zero matches down this branch, not an error.
-            Some((_, _, Err(HdfsError::FileNotFound(_)))) => {}
-            Some((_, _, Err(e))) => {
+            Some((_, _, _, Err(HdfsError::FileNotFound(_)))) => {}
+            // A forbidden directory below the root: zero matches down this
+            // branch when the caller opted in; the root stays strict.
+            Some((_, _, false, Err(ref e))) if options.skip_permission_errors && crate::is_permission(e) => {}
+            Some((_, _, _, Err(e))) => {
                 let _ = tx.send(Err(e)).await;
                 return;
             }

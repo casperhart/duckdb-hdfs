@@ -22,6 +22,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "globs that walk more than one directory (e.g. hdfs_ls('/path/**')); 1 disables "
 	                          "parallelism",
 	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HDFS_LIST_PARALLELISM));
+	config.AddExtensionOption("hdfs_skip_permission_errors",
+	                          "Prune subtrees whose listing fails with a permission error during HDFS globs and "
+	                          "recursive listings instead of failing the query; an error on the listed path or "
+	                          "glob root itself still fails",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("hdfs_include_hidden",
+	                          "Return hidden HDFS entries (names starting with '_' or '.', e.g. _temporary, "
+	                          "_SUCCESS) from listings, globs and scans; by default they are excluded unless a "
+	                          "glob component names them explicitly (e.g. '_*')",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	auto &fs = db.GetFileSystem();
 	auto hdfs_fs = make_uniq<HdfsFileSystem>();

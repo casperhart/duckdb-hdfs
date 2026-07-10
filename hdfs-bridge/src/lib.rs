@@ -28,7 +28,7 @@
 mod client;
 mod glob;
 
-pub use client::{BridgeClient, BridgeListStream, BridgeReader, BridgeWriter};
+pub use client::{BridgeClient, BridgeListStream, BridgeReader, BridgeWriter, WalkOptions};
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -177,6 +177,12 @@ unsafe fn set_status(status: *mut Status, code: i32, msg: impl std::fmt::Display
 /// Write a classified `HdfsError` with a context prefix into `*status`.
 unsafe fn set_error(status: *mut Status, context: impl std::fmt::Display, err: &HdfsError) {
     unsafe { set_status(status, classify(err), format_args!("{context}: {err}")) }
+}
+
+/// Whether an error is a permission failure — the class the walkers may prune
+/// when `WalkOptions::skip_permission_errors` is set.
+pub(crate) fn is_permission(err: &HdfsError) -> bool {
+    classify(err) == HDFS_ERR_PERMISSION
 }
 
 /// Convert a C string pointer into an owned `String`, returning `None` for null
@@ -455,18 +461,29 @@ fn statuses_to_entries(
 /// subtree is walked, with `max_parallelism` bounding the number of concurrent
 /// listing RPCs (values <= 1 list one directory at a time). Opening never
 /// fails; errors (including not-found) surface on the first `next` call.
+/// Unless `include_hidden`, entries named with a leading `.` or `_` are
+/// neither returned nor descended into (`path` itself is exempt). With
+/// `skip_permission_errors`, subtrees below `path` the caller may not list
+/// are pruned instead of failing the walk; errors on `path` itself always
+/// surface.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_list_stream_open(
     client: *mut BridgeClient,
     path: *const c_char,
     recursive: bool,
     max_parallelism: i32,
+    skip_permission_errors: bool,
+    include_hidden: bool,
 ) -> *mut BridgeListStream {
     let client = unsafe { &*client };
     let path = unsafe { CStr::from_ptr(path) }
         .to_string_lossy()
         .into_owned();
-    let stream = client.list_stream(path, recursive, max_parallelism.max(1) as usize);
+    let options = WalkOptions {
+        skip_permission_errors,
+        include_hidden,
+    };
+    let stream = client.list_stream(path, recursive, max_parallelism.max(1) as usize, options);
     Box::into_raw(Box::new(stream))
 }
 
@@ -477,18 +494,29 @@ pub unsafe extern "C" fn hdfs_bridge_list_stream_open(
 /// `max_parallelism` bounds the number of concurrent listing RPCs. Returns
 /// null with a non-OK status for an invalid pattern; a pattern matching
 /// nothing yields an empty stream, and other errors surface on `next`.
+/// Unless `include_hidden`, names with a leading `.` or `_` only match
+/// components that spell that character out literally (`_temporary`, `_*`),
+/// and `**` never matches or descends into them. With
+/// `skip_permission_errors`, directories below the pattern's literal root the
+/// caller may not list are pruned instead of failing the walk.
 #[no_mangle]
 pub unsafe extern "C" fn hdfs_bridge_glob_stream_open(
     client: *mut BridgeClient,
     pattern: *const c_char,
     max_parallelism: i32,
+    skip_permission_errors: bool,
+    include_hidden: bool,
     status: *mut Status,
 ) -> *mut BridgeListStream {
     let client = unsafe { &*client };
     let pattern = unsafe { CStr::from_ptr(pattern) }
         .to_string_lossy()
         .into_owned();
-    match client.glob_stream(pattern, max_parallelism.max(1) as usize) {
+    let options = WalkOptions {
+        skip_permission_errors,
+        include_hidden,
+    };
+    match client.glob_stream(pattern, max_parallelism.max(1) as usize, options) {
         Ok(stream) => Box::into_raw(Box::new(stream)),
         Err(e) => {
             unsafe { set_error(status, "invalid glob pattern", &e) };

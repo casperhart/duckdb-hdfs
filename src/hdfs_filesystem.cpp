@@ -469,7 +469,13 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
                                        optional_ptr<FileOpener> opener) {
 	// A single directory has no fan-out, so parallelism buys nothing here.
-	auto stream = OpenListStream(directory);
+	// Hidden entries are included regardless of the hdfs_include_hidden
+	// setting: DuckDB core acts on this listing (e.g. COPY TO's
+	// directory-not-empty check and OVERWRITE deletion), so filtering it
+	// would hide files from cleanup/safety checks, not just from display.
+	HdfsWalkOptions options;
+	options.include_hidden = true;
+	auto stream = OpenListStream(directory, /*max_parallelism=*/1, options);
 	bool any = false;
 	vector<HdfsEntry> batch;
 	while (stream->Next(batch, STANDARD_VECTOR_SIZE)) {
@@ -491,7 +497,16 @@ vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener
 		max_parallelism =
 		    static_cast<int32_t>(MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
 	}
-	auto stream = OpenGlobStream(path, max_parallelism);
+	// Glob discovery is a per-query surface, so the walk behavior settings
+	// apply here (hdfs_ls can additionally override them per call).
+	HdfsWalkOptions options;
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_skip_permission_errors", setting)) {
+		options.skip_permission_errors = setting.GetValue<bool>();
+	}
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_include_hidden", setting)) {
+		options.include_hidden = setting.GetValue<bool>();
+	}
+	auto stream = OpenGlobStream(path, max_parallelism, options);
 	vector<OpenFileInfo> result;
 	vector<HdfsEntry> batch;
 	while (stream->Next(batch, STANDARD_VECTOR_SIZE)) {
@@ -524,14 +539,16 @@ void HdfsListStream::Open() {
 	client = conn->Get(); // throws on connect failure
 	if (glob) {
 		BridgeStatus status;
-		handle = hdfs_bridge_glob_stream_open(client.get(), hdfs_path.c_str(), max_parallelism, &status);
+		handle = hdfs_bridge_glob_stream_open(client.get(), hdfs_path.c_str(), max_parallelism,
+		                                      options.skip_permission_errors, options.include_hidden, &status);
 		if (!handle) {
 			// Only an invalid pattern fails here; matching nothing is an
 			// empty stream, and cluster errors surface in Next().
 			throw IOException("Failed to glob HDFS pattern '%s': %s", url, status.Message());
 		}
 	} else {
-		handle = hdfs_bridge_list_stream_open(client.get(), hdfs_path.c_str(), /*recursive=*/false, max_parallelism);
+		handle = hdfs_bridge_list_stream_open(client.get(), hdfs_path.c_str(), /*recursive=*/false, max_parallelism,
+		                                      options.skip_permission_errors, options.include_hidden);
 	}
 }
 
@@ -572,23 +589,27 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries) {
 	}
 }
 
-unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, int32_t max_parallelism) {
+unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, int32_t max_parallelism,
+                                                          HdfsWalkOptions options) {
 	// Not make_uniq: the constructor is private to keep construction here.
 	auto stream = unique_ptr<HdfsListStream>(new HdfsListStream());
 	stream->url = url;
 	ParseHdfsPath(url, stream->authority, stream->hdfs_path);
 	stream->max_parallelism = max_parallelism;
+	stream->options = options;
 	stream->conn = &GetConnection(stream->authority);
 	stream->Open();
 	return stream;
 }
 
-unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, int32_t max_parallelism) {
+unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, int32_t max_parallelism,
+                                                          HdfsWalkOptions options) {
 	auto stream = unique_ptr<HdfsListStream>(new HdfsListStream());
 	stream->url = url;
 	ParseHdfsPath(url, stream->authority, stream->hdfs_path);
 	stream->glob = true;
 	stream->max_parallelism = max_parallelism;
+	stream->options = options;
 	stream->conn = &GetConnection(stream->authority);
 	stream->Open();
 	return stream;

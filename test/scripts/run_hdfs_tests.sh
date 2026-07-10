@@ -32,3 +32,11 @@ HDFS_TEST_RUNNING=1 \
 HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
 HADOOP_USER_NAME=hadoop \
     "${UNITTEST}" test/sql/hdfs.test
+
+echo "==> Running HDFS permission tests (as a non-superuser)..."
+# A separate run as a plain user: the superuser above bypasses HDFS permission
+# checks, so it can never hit the AccessControlExceptions these tests need.
+HDFS_TEST_RUNNING=1 \
+HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
+HADOOP_USER_NAME=guest \
+    "${UNITTEST}" test/sql/hdfs_permissions.test

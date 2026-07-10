@@ -8,6 +8,14 @@
 //! one), at most one `**` per pattern, and malformed character classes match
 //! nothing rather than erroring.
 //!
+//! Hidden entries (Hadoop convention: names starting with `.` or `_`, e.g.
+//! `_temporary`, `_SUCCESS`, `.staging`) are excluded unless the plan is built
+//! with `include_hidden`. Bash-style exception: a component that *explicitly*
+//! names the hidden character — a literal, or a pattern whose first character
+//! is a (possibly escaped) `.`/`_` like `_*` — still matches; wildcard first
+//! characters (`*`, `?`, `[`) never do, and `**` neither matches nor descends
+//! into hidden directories.
+//!
 //! A pattern compiles to a [`GlobPlan`]: brace groups are expanded into a set
 //! of component lists, and matching runs as a small NFA over directory levels.
 //! The walk carries a set of [`Pos`] states per directory and calls
@@ -52,10 +60,11 @@ pub struct GlobPlan {
     root: String,
     initial: Vec<Pos>,
     emit_root: bool,
+    include_hidden: bool,
 }
 
 impl GlobPlan {
-    pub fn parse(pattern: &str) -> Result<Self, HdfsError> {
+    pub fn parse(pattern: &str, include_hidden: bool) -> Result<Self, HdfsError> {
         let mut patterns = Vec::new();
         for expanded in expand_braces(pattern)? {
             let components: Vec<Component> = expanded
@@ -117,6 +126,7 @@ impl GlobPlan {
             root,
             initial,
             emit_root,
+            include_hidden,
         })
     }
 
@@ -143,12 +153,18 @@ impl GlobPlan {
             emit: false,
             next: Vec::new(),
         };
+        // A crawl is all wildcard: it never consumes a hidden level. The
+        // zero-level defer below still runs, so an explicit component after
+        // the `**` (e.g. `**/_SUCCESS`) can match a hidden name itself.
+        let crawl_blocked = !self.include_hidden && is_hidden(name);
         for &pos in states {
             let components = &self.patterns[pos.pat];
             if let Component::Crawl = components[pos.comp] {
                 // A crawl consumes the child as an intermediate level...
                 if pos.comp + 1 == components.len() {
-                    step.emit = true; // terminal `**`: everything matches
+                    if !crawl_blocked {
+                        step.emit = true; // terminal `**`: everything matches
+                    }
                 } else {
                     // ...or matches zero levels, deferring to the component
                     // after it.
@@ -162,7 +178,7 @@ impl GlobPlan {
                         &mut step,
                     );
                 }
-                if is_dir {
+                if is_dir && !crawl_blocked {
                     push_state(&mut step.next, pos); // keep crawling below
                 }
             } else {
@@ -177,8 +193,13 @@ impl GlobPlan {
     fn match_at(&self, pos: Pos, name: &str, is_dir: bool, step: &mut Step) {
         let components = &self.patterns[pos.pat];
         let matched = match &components[pos.comp] {
+            // Equality means a matching literal spells the hidden prefix out
+            // itself, so literals need no separate hidden check.
             Component::Literal(s) => name == s,
-            Component::Pattern(p) => match_component(name, p),
+            Component::Pattern(p) => {
+                (self.include_hidden || !is_hidden(name) || explicit_hidden_prefix(p))
+                    && match_component(name, p)
+            }
             // parse() rejects `**/**`, and step() never advances into a
             // crawl via match_at.
             Component::Crawl => unreachable!("crawl components are handled in step()"),
@@ -197,6 +218,23 @@ impl GlobPlan {
                 },
             );
         }
+    }
+}
+
+/// Hadoop-convention hidden name: starts with `.` or `_`.
+pub(crate) fn is_hidden(name: &str) -> bool {
+    name.starts_with('.') || name.starts_with('_')
+}
+
+/// Whether a raw pattern component explicitly names a hidden first character:
+/// a (possibly escaped) literal leading `.` or `_`. Wildcard first characters
+/// don't count.
+fn explicit_hidden_prefix(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    match chars.next() {
+        Some('\\') => matches!(chars.next(), Some('.' | '_')),
+        Some(c) => c == '.' || c == '_',
+        None => false,
     }
 }
 
@@ -491,23 +529,23 @@ mod test {
 
     #[test]
     fn plan_roots() {
-        let plan = GlobPlan::parse("/warehouse/db/table/*.parquet").unwrap();
+        let plan = GlobPlan::parse("/warehouse/db/table/*.parquet", false).unwrap();
         assert_eq!(plan.root(), "/warehouse/db/table");
         assert_eq!(plan.initial().len(), 1);
         assert!(!plan.emit_root());
 
         // Escaped wildcards make an all-literal pattern: the root matches.
-        let plan = GlobPlan::parse("/a/file\\*name").unwrap();
+        let plan = GlobPlan::parse("/a/file\\*name", false).unwrap();
         assert_eq!(plan.root(), "/a/file*name");
         assert!(plan.initial().is_empty());
         assert!(plan.emit_root());
 
         // Brace alternatives share only "/data" -> that's the root.
-        let plan = GlobPlan::parse("/data/{2024/01,2025/02}/part-*").unwrap();
+        let plan = GlobPlan::parse("/data/{2024/01,2025/02}/part-*", false).unwrap();
         assert_eq!(plan.root(), "/data");
         assert_eq!(plan.initial().len(), 2);
 
-        assert!(GlobPlan::parse("/a/**/b/**").is_err()); // multiple '**'
+        assert!(GlobPlan::parse("/a/**/b/**", false).is_err()); // multiple '**'
     }
 
     #[test]
@@ -519,23 +557,23 @@ mod test {
             ),
             ("/data/sub", vec![("c.csv", false)]),
         ];
-        let plan = GlobPlan::parse("/data/*.csv").unwrap();
+        let plan = GlobPlan::parse("/data/*.csv", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/data/a.csv"]);
 
         // '*' matches directories too, but only emits (never lists) them.
-        let plan = GlobPlan::parse("/data/*").unwrap();
+        let plan = GlobPlan::parse("/data/*", false).unwrap();
         assert_eq!(
             run_walk(&plan, &tree),
             vec!["/data/a.csv", "/data/b.txt", "/data/sub"]
         );
 
-        let plan = GlobPlan::parse("/data/[ab].*").unwrap();
+        let plan = GlobPlan::parse("/data/[ab].*", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/data/a.csv", "/data/b.txt"]);
 
-        let plan = GlobPlan::parse("/data/*/*.csv").unwrap();
+        let plan = GlobPlan::parse("/data/*/*.csv", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/data/sub/c.csv"]);
 
-        let plan = GlobPlan::parse("/data/zzz*").unwrap();
+        let plan = GlobPlan::parse("/data/zzz*", false).unwrap();
         assert!(run_walk(&plan, &tree).is_empty());
     }
 
@@ -547,7 +585,7 @@ mod test {
             ("/d/a/b", vec![("z.parquet", false)]),
         ];
         // Terminal '**' emits everything at every depth, directories included.
-        let plan = GlobPlan::parse("/d/**").unwrap();
+        let plan = GlobPlan::parse("/d/**", false).unwrap();
         assert_eq!(
             run_walk(&plan, &tree),
             vec![
@@ -560,14 +598,14 @@ mod test {
         );
 
         // '**' also matches zero levels (DuckDB semantics).
-        let plan = GlobPlan::parse("/d/**/*.parquet").unwrap();
+        let plan = GlobPlan::parse("/d/**/*.parquet", false).unwrap();
         assert_eq!(
             run_walk(&plan, &tree),
             vec!["/d/a/b/z.parquet", "/d/a/y.parquet", "/d/x.parquet"]
         );
 
         // A component after '**' prunes what gets emitted, not the descent.
-        let plan = GlobPlan::parse("/d/**/b/*.parquet").unwrap();
+        let plan = GlobPlan::parse("/d/**/b/*.parquet", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/d/a/b/z.parquet"]);
     }
 
@@ -579,11 +617,91 @@ mod test {
             ("/d/feb", vec![("2.csv", false)]),
             ("/d/mar", vec![("3.csv", false)]),
         ];
-        let plan = GlobPlan::parse("/d/{jan,feb}/*.csv").unwrap();
+        let plan = GlobPlan::parse("/d/{jan,feb}/*.csv", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/d/feb/2.csv", "/d/jan/1.csv"]);
 
         // Overlapping alternatives must not emit duplicates.
-        let plan = GlobPlan::parse("/d/{jan,j*}/*.csv").unwrap();
+        let plan = GlobPlan::parse("/d/{jan,j*}/*.csv", false).unwrap();
         assert_eq!(run_walk(&plan, &tree), vec!["/d/jan/1.csv"]);
+    }
+
+    #[test]
+    fn walk_hidden() {
+        let tree = vec![
+            (
+                "/d",
+                vec![
+                    ("a.csv", false),
+                    ("_SUCCESS", false),
+                    (".staged", false),
+                    ("_temporary", true),
+                    ("sub", true),
+                ],
+            ),
+            ("/d/_temporary", vec![("part.csv", false)]),
+            ("/d/sub", vec![("b.csv", false), ("_SUCCESS", false)]),
+        ];
+
+        // Wildcards skip hidden names by default.
+        let plan = GlobPlan::parse("/d/*", false).unwrap();
+        assert_eq!(run_walk(&plan, &tree), vec!["/d/a.csv", "/d/sub"]);
+
+        // A crawl neither emits hidden entries nor descends into hidden dirs.
+        let plan = GlobPlan::parse("/d/**", false).unwrap();
+        assert_eq!(
+            run_walk(&plan, &tree),
+            vec!["/d/a.csv", "/d/sub", "/d/sub/b.csv"]
+        );
+
+        // include_hidden restores everything.
+        let plan = GlobPlan::parse("/d/*", true).unwrap();
+        assert_eq!(
+            run_walk(&plan, &tree),
+            vec![
+                "/d/.staged",
+                "/d/_SUCCESS",
+                "/d/_temporary",
+                "/d/a.csv",
+                "/d/sub"
+            ]
+        );
+        let plan = GlobPlan::parse("/d/**", true).unwrap();
+        assert_eq!(
+            run_walk(&plan, &tree),
+            vec![
+                "/d/.staged",
+                "/d/_SUCCESS",
+                "/d/_temporary",
+                "/d/_temporary/part.csv",
+                "/d/a.csv",
+                "/d/sub",
+                "/d/sub/_SUCCESS",
+                "/d/sub/b.csv"
+            ]
+        );
+
+        // Explicitly naming a hidden directory still works: the literal is the
+        // walk root here, and its non-hidden children match.
+        let plan = GlobPlan::parse("/d/_temporary/*", false).unwrap();
+        assert_eq!(run_walk(&plan, &tree), vec!["/d/_temporary/part.csv"]);
+
+        // A pattern starting with an explicit (or escaped) hidden character
+        // matches hidden names; `[...]`/`?`/`*` first characters don't.
+        let plan = GlobPlan::parse("/d/_*", false).unwrap();
+        assert_eq!(run_walk(&plan, &tree), vec!["/d/_SUCCESS", "/d/_temporary"]);
+        let plan = GlobPlan::parse("/d/\\_*", false).unwrap();
+        assert_eq!(run_walk(&plan, &tree), vec!["/d/_SUCCESS", "/d/_temporary"]);
+        let plan = GlobPlan::parse("/d/[_a]*", false).unwrap();
+        assert_eq!(run_walk(&plan, &tree), vec!["/d/a.csv"]);
+        let plan = GlobPlan::parse("/d/?SUCCESS", false).unwrap();
+        assert!(run_walk(&plan, &tree).is_empty());
+
+        // An explicit literal after a `**` matches hidden names via the
+        // crawl's zero-level defer, even though the crawl itself won't.
+        let plan = GlobPlan::parse("/d/**/_SUCCESS", false).unwrap();
+        assert_eq!(
+            run_walk(&plan, &tree),
+            vec!["/d/_SUCCESS", "/d/sub/_SUCCESS"]
+        );
     }
 }

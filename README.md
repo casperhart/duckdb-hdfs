@@ -76,11 +76,34 @@ switches `hdfs_ls` to glob semantics: matched entries come back *as rows
 themselves* (like `ls -d`), files and directories both, and a pattern
 matching nothing returns an empty result rather than an error. A path
 without wildcards keeps plain `ls` semantics: a directory lists its children
-(use `hdfs_stat` for a wildcard-free path's own entry). Unlike the shell,
-`*` also matches dot-prefixed names, and rows arrive in completion order —
-use `ORDER BY path` when order matters. The same globber backs
-`read_parquet` / `read_csv` / `glob()` over `hdfs://`, so `**` works there
-too.
+(use `hdfs_stat` for a wildcard-free path's own entry). Rows arrive in
+completion order — use `ORDER BY path` when order matters. The same globber
+backs `read_parquet` / `read_csv` / `glob()` over `hdfs://`, so `**` works
+there too.
+
+**Hidden entries.** Names starting with `_` or `.` (Hadoop's hidden
+convention: `_temporary`, `_SUCCESS`, `.staging`, …) are job bookkeeping, not
+data, so listings, globs and scans exclude them by default — they are neither
+returned nor descended into, which also means a Spark/Hive job deleting its
+`_temporary` directory mid-query can't trip the walk. Like the shell, naming
+the hidden character explicitly overrides this: a literal path
+(`hdfs_ls('/data/_temporary')`) or a pattern whose first character is `_`/`.`
+(`'/data/_*'`) matches hidden entries; wildcard first characters (`*`, `?`,
+`[`) never do. Opt back in per call with `hdfs_ls(path, include_hidden :=
+true)` or session-wide (covering `read_parquet` etc.) with `SET
+hdfs_include_hidden = true`.
+
+**Permission errors.** By default a walk fails on the first directory the
+connecting user may not list. When restricted subtrees are expected (e.g.
+per-group partition directories), skip them instead with
+`hdfs_ls(path, skip_permission_errors := true)` or, for scans, `SET
+hdfs_skip_permission_errors = true`; forbidden subtrees are then pruned and
+everything readable is returned. The listed path or glob root itself always
+stays strict — a query against a tree you can't see at all fails rather than
+returning zero rows. Other failures (connection loss, authentication) always
+fail the query. A subdirectory deleted while the walk runs is skipped
+regardless of settings; entries already returned from under it may remain in
+the result.
 
 **Keeping it fast.** HDFS has no server-side glob RPC, so patterns expand
 client-side by walking the tree with one `getListing` per directory that can
@@ -108,6 +131,8 @@ your Hadoop config (`fs.defaultFS`).
 | Setting | Default | Description |
 |---|---|---|
 | `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by listings and globs that walk more than one directory (`hdfs_ls('/path/**')`, `read_parquet('.../**/*.parquet')`, …). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
+| `hdfs_include_hidden` | `false` | Return hidden entries (names starting with `_` or `.`) from listings, globs and scans. See "Hidden entries" above; `hdfs_ls` can override per call with `include_hidden := …`. |
+| `hdfs_skip_permission_errors` | `false` | Prune subtrees whose listing fails with a permission error instead of failing the query (the listed path or glob root itself still fails). See "Permission errors" above; `hdfs_ls` can override per call with `skip_permission_errors := …`. |
 
 ```sql
 SET hdfs_list_parallelism = 64;

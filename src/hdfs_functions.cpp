@@ -73,6 +73,11 @@ struct HdfsMetaBindData : public TableFunctionData {
 	HdfsFileSystem *hdfs = nullptr;
 	HdfsMetaOp op = HdfsMetaOp::LIST;
 	string path;
+	// Per-call overrides of the hdfs_skip_permission_errors /
+	// hdfs_include_hidden settings; NULL (unset) falls back to the setting at
+	// execution time.
+	Value skip_permission_errors;
+	Value include_hidden;
 };
 
 unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindInput &input,
@@ -82,6 +87,14 @@ unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindI
 	result->hdfs = info.hdfs;
 	result->op = info.op;
 	result->path = input.inputs[0].GetValue<string>();
+	// Only hdfs_ls registers these; for hdfs_stat the map is empty.
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "skip_permission_errors") {
+			result->skip_permission_errors = kv.second;
+		} else if (kv.first == "include_hidden") {
+			result->include_hidden = kv.second;
+		}
+	}
 
 	DefineMetadataSchema(return_types, names);
 	return std::move(result);
@@ -107,22 +120,40 @@ int32_t ListParallelism(ClientContext &context) {
 	return static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
 }
 
+// Resolve one walk flag: the per-call named parameter wins; unset (NULL)
+// falls back to the session setting, which shares its default with Glob().
+bool WalkFlag(ClientContext &context, const Value &override_value, const char *setting_name) {
+	if (!override_value.IsNull()) {
+		return BooleanValue::Get(override_value);
+	}
+	Value setting;
+	if (context.TryGetCurrentSetting(setting_name, setting)) {
+		return setting.GetValue<bool>();
+	}
+	return false;
+}
+
 unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
 	auto state = make_uniq<HdfsMetaGlobalState>();
 	switch (bind_data.op) {
-	case HdfsMetaOp::LIST:
+	case HdfsMetaOp::LIST: {
+		HdfsWalkOptions options;
+		options.skip_permission_errors =
+		    WalkFlag(context, bind_data.skip_permission_errors, "hdfs_skip_permission_errors");
+		options.include_hidden = WalkFlag(context, bind_data.include_hidden, "hdfs_include_hidden");
 		// A path with glob characters returns the matched entries themselves
 		// (files and directories; `**` walks the subtree); a literal path
 		// lists the directory's children. Escapes don't suppress detection:
 		// like DuckDB's globber, any of these characters selects glob mode,
 		// and `\*` etc. are then matched literally by the pattern itself.
 		if (bind_data.path.find_first_of("*?[{") != string::npos) {
-			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context));
+			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context), options);
 		} else {
-			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context));
+			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context), options);
 		}
 		break;
+	}
 	case HdfsMetaOp::STAT:
 		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path));
 		break;
@@ -206,9 +237,12 @@ void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 } // namespace
 
 void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
-	// hdfs_ls(path_or_pattern)
+	// hdfs_ls(path_or_pattern, skip_permission_errors := ..., include_hidden := ...)
 	auto ls = MakeMetaFunction("hdfs_ls");
 	ls.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::LIST);
+	// Per-call overrides of the same-named hdfs_* settings (both default false).
+	ls.named_parameters["skip_permission_errors"] = LogicalType::BOOLEAN;
+	ls.named_parameters["include_hidden"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(ls);
 
 	// hdfs_stat(path)

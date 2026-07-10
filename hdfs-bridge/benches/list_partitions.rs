@@ -164,7 +164,8 @@ unsafe fn run_stream(
     par: i32,
 ) -> (Duration, Duration, usize) {
     let start = Instant::now();
-    let stream = hdfs_bridge_list_stream_open(client, root.as_ptr(), true, par);
+    // include_hidden so the walk covers the whole tree, matching run_sequential.
+    let stream = hdfs_bridge_list_stream_open(client, root.as_ptr(), true, par, false, true);
     let mut total = 0usize;
     let mut first = None;
     loop {

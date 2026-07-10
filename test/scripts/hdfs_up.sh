@@ -61,5 +61,28 @@ else
     echo "WARNING: ${DUCKDB_BIN} not found; skipping parquet fixture. Run 'make' first." >&2
 fi
 
+# Hidden-entry fixtures (CSV + an empty marker, so they don't depend on the
+# parquet fixture): a visible tree interleaved with Spark/Hive-style hidden
+# entries. Their own root keeps the /test counts in hdfs.test stable.
+docker exec "${CONTAINER}" bash -lc "
+    hdfs dfs -mkdir -p /hidtest/_temporary /hidtest/nested &&
+    hdfs dfs -put -f /tmp/data.csv /hidtest/visible.csv &&
+    hdfs dfs -put -f /tmp/data.csv /hidtest/.staged.csv &&
+    hdfs dfs -put -f /tmp/data.csv /hidtest/_temporary/part-0001.csv &&
+    hdfs dfs -put -f /tmp/data.csv /hidtest/nested/more.csv &&
+    hdfs dfs -touchz /hidtest/nested/_SUCCESS
+"
+
+# Permission fixtures: /permtest/locked is listable only by its owner (the
+# superuser). hdfs_permissions.test connects as a non-superuser to hit real
+# AccessControlExceptions — the main suite's superuser bypasses permission
+# checks entirely.
+docker exec "${CONTAINER}" bash -lc "
+    hdfs dfs -mkdir -p /permtest/open /permtest/locked &&
+    hdfs dfs -put -f /tmp/data.csv /permtest/open/a.csv &&
+    hdfs dfs -put -f /tmp/data.csv /permtest/locked/b.csv &&
+    hdfs dfs -chmod 700 /permtest/locked
+"
+
 echo "==> HDFS is ready. Fixtures:"
-docker exec "${CONTAINER}" hdfs dfs -ls -R /test
+docker exec "${CONTAINER}" hdfs dfs -ls -R /test /hidtest /permtest
