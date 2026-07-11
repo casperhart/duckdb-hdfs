@@ -661,8 +661,8 @@ dependencies = [
 
 [[package]]
 name = "hdfs-native"
-version = "0.14.1"
-source = "git+https://github.com/casperhart/hdfs-native?branch=kms#490ce93024022b9d6f786f99f0b44b75fd330c72"
+version = "0.14.2"
+source = "git+https://github.com/Kimahriman/hdfs-native#8f0f6588e54b97a37ff3a2d87a6027bb8f0aec72"
 dependencies = [
  "aes",
  "base64",

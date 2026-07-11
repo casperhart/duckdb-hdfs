@@ -8,7 +8,7 @@ edition = "2021"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-hdfs-native = { git = "https://github.com/casperhart/hdfs-native", branch = "kms", features = ["kms-rustls-tls"] }
+hdfs-native = { git = "https://github.com/Kimahriman/hdfs-native", features = ["kms-rustls-tls"] }
 libc = "0.2"
 # The bridge drives hdfs-native's async client directly (the sync wrapper hides
 # its runtime, which the parallel recursive listing needs). These are all

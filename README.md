@@ -1,9 +1,9 @@
 # DuckDB HDFS extension
 
-`hdfs` adds a native HDFS filesystem to DuckDB, letting you read and write files
-on Hadoop HDFS directly via `hdfs://` URLs — no JVM, no `libhdfs`. It is backed
-by the pure-Rust [`hdfs-native`](https://github.com/Kimahriman/hdfs-native)
-client through a thin C FFI bridge (`hdfs-bridge/`).
+`hdfs` adds a native HDFS filesystem to DuckDB: read and write `hdfs://` URLs
+directly — no JVM, no `libhdfs`. It is backed by the pure-Rust
+[`hdfs-native`](https://github.com/Kimahriman/hdfs-native) client through a
+thin C FFI bridge (`hdfs-bridge/`).
 
 ```sql
 -- Read
@@ -17,112 +17,65 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 ## What works
 
 - Reading any file format DuckDB supports (Parquet, CSV, JSON, …) over `hdfs://`.
-- Writing via `COPY ... TO 'hdfs://...'`, including `PARTITION_BY` (HDFS is
-  append-only; random writes are not supported).
-- Globbing (`hdfs://host:port/dir/*.parquet`, `.../dir/**/*.parquet`),
-  directory listing, `FileExists`, size/last-modified metadata.
-- Directory and file management: create/remove directories, remove files, rename
-  (move).
-- Concurrent positional reads (DuckDB's parallel Parquet reader) on a single
-  handle.
-- Reading and writing data in HDFS encryption zones (Transparent Data
-  Encryption): the KMS is contacted over TLS to unwrap the key, and data is
-  decrypted/encrypted client-side. Requires the Hadoop key provider to be
-  configured (`hadoop.security.key.provider.path` / `dfs.encryption.key.provider.uri`).
+- Writing via `COPY ... TO`, including `PARTITION_BY` (HDFS is append-only;
+  random writes are not supported).
+- Globbing, directory listing, file metadata, and directory/file management
+  (create/remove directories, remove files, rename).
+- Concurrent positional reads (DuckDB's parallel Parquet reader).
+- HDFS encryption zones (Transparent Data Encryption): data is
+  decrypted/encrypted client-side, unwrapping keys via the KMS over TLS.
+  Requires the Hadoop key provider to be configured
+  (`hadoop.security.key.provider.path` / `dfs.encryption.key.provider.uri`).
 
-## Querying HDFS metadata
+## Listing and metadata
 
-Besides reading and writing file *contents*, the extension exposes HDFS
-*metadata* as SQL. These return full `FileStatus` metadata — type, size, owner,
-group, permissions, replication, block size, and modification/access times — and,
-unlike DuckDB's built-in `glob()`, they include directories.
+Three read-only SQL functions expose HDFS metadata. Unlike DuckDB's built-in
+`glob()`, they include directories and return full `FileStatus` metadata.
 
 ```sql
--- List a directory's immediate children (directories included).
+-- List a directory's children.
 SELECT name, type, size, owner, permissions
 FROM hdfs_ls('hdfs://namenode:8020/data');
 
--- Walk the whole subtree ('**' matches zero or more path levels).
+-- Recurse with '**', or glob — matched entries come back as rows.
 SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/**');
-
--- Glob patterns return the matched entries themselves (directories kept).
-SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/year=*/month=*/*.parquet');
 SELECT * FROM hdfs_ls('hdfs://namenode:8020/data/**/*.parquet');
-SELECT * FROM hdfs_ls('hdfs://namenode:8020/logs/2026-0{1,2,3}/*.gz');
 
--- Filter with SQL rather than a glob when one directory is enough (one RPC).
-SELECT * FROM hdfs_ls('hdfs://namenode:8020/data')
-WHERE starts_with(name, 'temp_');
-
--- Metadata for one path (file or directory), as a single row.
+-- Metadata for a single path, as one row.
 SELECT * FROM hdfs_stat('hdfs://namenode:8020/data');
 
 -- Existence check (scalar boolean).
 SELECT hdfs_exists('hdfs://namenode:8020/data/events');
 ```
 
-Columns for `hdfs_ls` / `hdfs_stat` (identical, so results
-compose/`UNION`): `path` (full `hdfs://` URL), `name` (basename), `type`
-(`'file'`/`'directory'`), `size`, `owner`, `group`, `permissions` (symbolic
-`rwxr-xr-x`), `mode` (raw permission bits), `replication`, `block_size` (both
-`NULL` for directories), `last_modified`, `last_accessed`.
+`hdfs_ls` and `hdfs_stat` return the same columns: `path`, `name`, `type`
+(`'file'`/`'directory'`), `size`, `owner`, `group`, `permissions`
+(`rwxr-xr-x`), `mode`, `replication`, `block_size`, `last_modified`,
+`last_accessed`. Row order is not guaranteed — add `ORDER BY path` if it
+matters.
 
-**Glob syntax and semantics.** Patterns follow DuckDB's globber — `*` (within
-one path level), `?`, `[abc]` / `[a-b]` / `[!abc]` character classes, `\`
-escapes, and `**` as a whole component matching zero or more levels (at most
-one per pattern) — extended with Hadoop-style `{a,b}` alternation, which may
-span `/` (`/data/{2024/12,2025/01}/*`). A path containing any of `* ? [ {`
-switches `hdfs_ls` to glob semantics: matched entries come back *as rows
-themselves* (like `ls -d`), files and directories both, and a pattern
-matching nothing returns an empty result rather than an error. A path
-without wildcards keeps plain `ls` semantics: a directory lists its children
-(use `hdfs_stat` for a wildcard-free path's own entry). Rows arrive in
-completion order — use `ORDER BY path` when order matters. The same globber
-backs `read_parquet` / `read_csv` / `glob()` over `hdfs://`, so `**` works
-there too.
+Behavior notes:
 
-**Hidden entries.** Names starting with `_` or `.` (Hadoop's hidden
-convention: `_temporary`, `_SUCCESS`, `.staging`, …) are job bookkeeping, not
-data, so listings, globs and scans exclude them by default — they are neither
-returned nor descended into, which also means a Spark/Hive job deleting its
-`_temporary` directory mid-query can't trip the walk. Like the shell, naming
-the hidden character explicitly overrides this: a literal path
-(`hdfs_ls('/data/_temporary')`) or a pattern whose first character is `_`/`.`
-(`'/data/_*'`) matches hidden entries; wildcard first characters (`*`, `?`,
-`[`) never do. Opt back in per call with `hdfs_ls(path, include_hidden :=
-true)` or session-wide (covering `read_parquet` etc.) with `SET
-hdfs_include_hidden = true`.
+- **Globs** use DuckDB's syntax (`*`, `?`, `[abc]`, `**` for any depth) plus
+  Hadoop-style `{a,b}` alternation, and also work in `read_parquet` /
+  `read_csv` / `glob()`. A path with wildcards makes `hdfs_ls` return the
+  matched entries themselves (like `ls -d`; no matches → empty result); a
+  plain directory path lists its children.
+- **Hidden entries** (names starting with `_` or `.`, e.g. `_SUCCESS`) are
+  skipped unless the path names them explicitly (`'/data/_*'`) or you set
+  `include_hidden := true` / `SET hdfs_include_hidden = true`.
+- **Permission errors** fail the query; `skip_permission_errors := true` (or
+  the `SET` variant) prunes unreadable subtrees instead. The root path itself
+  still fails.
+- **Performance**: globs expand client-side, one listing RPC per candidate
+  directory (up to `hdfs_list_parallelism` in parallel), so anchor patterns
+  deep — `/data/2024/*` starts listing at `/data/2024`, while `**` walks the
+  whole subtree.
 
-**Permission errors.** By default a walk fails on the first directory the
-connecting user may not list. When restricted subtrees are expected (e.g.
-per-group partition directories), skip them instead with
-`hdfs_ls(path, skip_permission_errors := true)` or, for scans, `SET
-hdfs_skip_permission_errors = true`; forbidden subtrees are then pruned and
-everything readable is returned. The listed path or glob root itself always
-stays strict — a query against a tree you can't see at all fails rather than
-returning zero rows. Other failures (connection loss, authentication) always
-fail the query. A subdirectory deleted while the walk runs is skipped
-regardless of settings; entries already returned from under it may remain in
-the result.
+## URLs
 
-**Keeping it fast.** HDFS has no server-side glob RPC, so patterns expand
-client-side by walking the tree with one `getListing` per directory that can
-still match — cost scales with the pattern's fan-out, and up to
-`hdfs_list_parallelism` listings run concurrently. Nothing above the pattern's
-literal prefix is listed (`/data/2024/*` starts at `/data/2024`), so anchor
-patterns as deep as you can; `**` necessarily walks the whole subtree below
-its anchor. For single-directory filtering, `hdfs_ls(dir) WHERE …` (one RPC)
-beats a glob. Requesting the full metadata columns adds **no** extra RPCs —
-HDFS already returns them in the same listing call.
-
-These functions are read-only (metadata queries); the extension does not expose
-SQL functions that mutate the filesystem.
-
-## URL / authority handling
-
-Paths are `hdfs://<host>:<port>/<path>`. The `host:port` authority selects the
-NameNode. A scheme-only default-FS form (`hdfs:///path`) uses the NameNode from
-your Hadoop config (`fs.defaultFS`).
+Paths are `hdfs://host:port/path`; `host:port` selects the NameNode. The
+scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 
 ## Configuration
 
@@ -130,9 +83,9 @@ your Hadoop config (`fs.defaultFS`).
 
 | Setting | Default | Description |
 |---|---|---|
-| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing RPCs used by listings and globs that walk more than one directory (`hdfs_ls('/path/**')`, `read_parquet('.../**/*.parquet')`, …). The walk fans out per directory, so flat directories see no speedup. Set to `1` to list one directory at a time; raise it cautiously on shared clusters, since it multiplies NameNode request load. |
-| `hdfs_include_hidden` | `false` | Return hidden entries (names starting with `_` or `.`) from listings, globs and scans. See "Hidden entries" above; `hdfs_ls` can override per call with `include_hidden := …`. |
-| `hdfs_skip_permission_errors` | `false` | Prune subtrees whose listing fails with a permission error instead of failing the query (the listed path or glob root itself still fails). See "Permission errors" above; `hdfs_ls` can override per call with `skip_permission_errors := …`. |
+| `hdfs_list_parallelism` | `16` | Max concurrent directory-listing RPCs for recursive listings and globs. Raise cautiously on shared clusters — it multiplies NameNode load. |
+| `hdfs_include_hidden` | `false` | Include hidden (`_`/`.`) entries in listings, globs and scans. Per-call override: `include_hidden := …`. |
+| `hdfs_skip_permission_errors` | `false` | Skip unreadable subtrees instead of failing the query. Per-call override: `skip_permission_errors := …`. |
 
 ```sql
 SET hdfs_list_parallelism = 64;
@@ -140,22 +93,22 @@ SET hdfs_list_parallelism = 64;
 
 ### Connection configuration
 
-Connection config is resolved by `hdfs-native` from the standard Hadoop
+`hdfs-native` resolves connection config from the standard Hadoop
 environment, exactly as the Hadoop CLI tools do:
 
-- **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`, or
-  failing that `HADOOP_HOME/etc/hadoop`.
+- **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`,
+  or failing that `HADOOP_HOME/etc/hadoop`.
 - **Effective user**: `HADOOP_USER_NAME` (or `HADOOP_PROXY_USER`), else the
-  current OS account; on a Kerberos-secured cluster the identity comes from the
-  ticket/keytab.
+  current OS account; on a Kerberos-secured cluster the identity comes from
+  the ticket/keytab.
 
 ```sh
 export HADOOP_CONF_DIR=/etc/hadoop/conf
 export HADOOP_USER_NAME=analytics   # only on non-secure clusters
 ```
 
-In an embedded context (e.g. Python), set these in the environment before the
-first HDFS access — the client is created lazily on first use.
+In an embedded context (e.g. Python), set these before the first HDFS access —
+the client is created lazily.
 
 ## Building
 
@@ -174,17 +127,15 @@ Artifacts:
 
 ## Testing
 
-Unit/SQL tests that don't need a cluster run with:
+Tests that don't need a cluster run with:
 
 ```sh
 make test
 ```
 
-The HDFS integration tests (`test/sql/hdfs.test`) run against a real single-node
-HDFS in Docker. They are gated behind `require-env HDFS_TEST_RUNNING`, so they
-are skipped by `make test` unless a cluster is up.
-
-To run them end-to-end (requires Docker):
+The HDFS integration tests (`test/sql/hdfs.test`) run against a real
+single-node HDFS in Docker, gated behind `require-env HDFS_TEST_RUNNING`. To
+run them end-to-end (requires Docker):
 
 ```sh
 make                              # ensure duckdb + extension are built
@@ -201,8 +152,8 @@ test/scripts/hdfs_down.sh
 ```
 
 See `test/docker/` for the cluster definition. The one detail that makes HDFS
-reachable from the host (outside Docker's network) is advertising the DataNode
-as `localhost` and setting `dfs.client.use.datanode.hostname=true` on the client
+reachable from the host is advertising the DataNode as `localhost` and setting
+`dfs.client.use.datanode.hostname=true` on the client
 (`test/hdfs-conf/hdfs-site.xml`).
 
 ## Layout
