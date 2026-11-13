@@ -7,14 +7,12 @@
 #include "duckdb/main/config.hpp"
 #include "hdfs_filesystem.hpp"
 #include "hdfs_functions.hpp"
+#include "hdfs_secret.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register the hdfs:// virtual filesystem. Connection config (Hadoop config
-	// dir, effective user, Kerberos) is resolved by hdfs-native from the
-	// standard Hadoop environment (HADOOP_CONF_DIR / HADOOP_HOME, HADOOP_USER_NAME
-	// / keytab / current account), so connection details need no settings here.
+	RegisterHdfsSecret(loader);
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("hdfs_list_parallelism",

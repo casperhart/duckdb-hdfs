@@ -1,0 +1,101 @@
+# name: test/sql/hdfs_kerberos.test
+# description: 显式 Kerberos 身份与真实 HDFS 的可选集成验证。
+# group: [sql]
+
+require hdfs
+
+require parquet
+
+require-env HDFS_KERBEROS_TEST_RUNNING
+
+require-env HDFS_KERBEROS_FS_NAME
+
+require-env HDFS_KERBEROS_PRINCIPAL_A
+
+require-env HDFS_KERBEROS_KEYTAB_A
+
+require-env HDFS_KERBEROS_PRINCIPAL_B
+
+require-env HDFS_KERBEROS_KEYTAB_B
+
+require-env HDFS_KERBEROS_ROOT_A
+
+require-env HDFS_KERBEROS_ROOT_B
+
+require-env HDFS_KERBEROS_RUN_ID
+
+require-env HDFS_KERBEROS_ENV_FILE
+
+require-env KRB5_CONFIG
+
+
+# 两个目录须预先配置为各自身份可读写、另一身份无读取权限。
+# RUN_ID 须唯一；用例保留两份新文件作为证据，不修改已有文件或权限。
+statement ok
+CREATE TEMPORARY SECRET identity_a (TYPE hdfs, FS_NAME '${HDFS_KERBEROS_FS_NAME}', SCOPE '${HDFS_KERBEROS_ROOT_A}', PRINCIPAL '${HDFS_KERBEROS_PRINCIPAL_A}', KEYTAB '${HDFS_KERBEROS_KEYTAB_A}');
+
+statement ok
+CREATE TEMPORARY SECRET identity_b (TYPE hdfs, FS_NAME '${HDFS_KERBEROS_FS_NAME}', SCOPE '${HDFS_KERBEROS_ROOT_B}', PRINCIPAL '${HDFS_KERBEROS_PRINCIPAL_B}', KEYTAB '${HDFS_KERBEROS_KEYTAB_B}');
+
+statement ok
+COPY (SELECT 11 AS id) TO '${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT 22 AS id) TO '${HDFS_KERBEROS_ROOT_B}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet' (FORMAT parquet);
+
+concurrentloop i 0 4
+
+query I
+SELECT id FROM read_parquet('${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+----
+11
+
+query I
+SELECT id FROM read_parquet('${HDFS_KERBEROS_ROOT_B}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+----
+22
+
+endloop
+
+query I
+SELECT count(*) FROM hdfs_ls('${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+----
+1
+
+query I
+SELECT count(*) FROM hdfs_stat('${HDFS_KERBEROS_ROOT_B}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet') WHERE size > 0;
+----
+1
+
+# 替换已用过的身份，不能借用旧身份的连接或回退环境身份。
+statement ok
+CREATE OR REPLACE TEMPORARY SECRET identity_a (TYPE hdfs, FS_NAME '${HDFS_KERBEROS_FS_NAME}', SCOPE '${HDFS_KERBEROS_ROOT_A}', PRINCIPAL '${HDFS_KERBEROS_PRINCIPAL_B}', KEYTAB '${HDFS_KERBEROS_KEYTAB_B}');
+
+statement error
+SELECT * FROM hdfs_stat('${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+----
+Permission denied
+
+statement ok
+CREATE OR REPLACE TEMPORARY SECRET identity_a (TYPE hdfs, FS_NAME '${HDFS_KERBEROS_FS_NAME}', SCOPE '${HDFS_KERBEROS_ROOT_A}', PRINCIPAL '${HDFS_KERBEROS_PRINCIPAL_A}', KEYTAB '/nonexistent/duckdb-hdfs-test.keytab');
+
+statement error
+SELECT * FROM hdfs_stat('${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+
+statement ok
+CREATE OR REPLACE TEMPORARY SECRET identity_a (TYPE hdfs, FS_NAME '${HDFS_KERBEROS_FS_NAME}', SCOPE '${HDFS_KERBEROS_ROOT_A}', PRINCIPAL 'duckdb-invalid-principal@INVALID.REALM', KEYTAB '${HDFS_KERBEROS_KEYTAB_A}');
+
+statement error
+SELECT * FROM hdfs_stat('${HDFS_KERBEROS_ROOT_A}/duckdb-secret-${HDFS_KERBEROS_RUN_ID}.parquet');
+
+statement ok
+DROP SECRET identity_a;
+
+statement ok
+DROP SECRET identity_b;
+
+# ENV_FILE 是预先存在且由进程环境身份可读的文件，不要求格式。
+query I
+SELECT hdfs_exists('${HDFS_KERBEROS_ENV_FILE}')::INTEGER;
+----
+1

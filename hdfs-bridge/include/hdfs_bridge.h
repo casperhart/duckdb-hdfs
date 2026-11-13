@@ -132,6 +132,20 @@ struct hdfs_client_t *hdfs_bridge_connect(const char *url,
                                           const char *user,
                                           struct hdfs_status_t *status);
 
+/**
+ * 显式连接入口；配置数组在调用内复制，不保留调用方指针。
+ * 非零 count 要求 keys 和 values 及其元素均非空指针。
+ */
+struct hdfs_client_t *hdfs_bridge_connect_config(const char *url,
+                                                 const char *config_dir,
+                                                 const char *user,
+                                                 const char *principal,
+                                                 const char *keytab,
+                                                 const char *const *keys,
+                                                 const char *const *values,
+                                                 uintptr_t count,
+                                                 struct hdfs_status_t *status);
+
 void hdfs_bridge_free_client(struct hdfs_client_t *client);
 
 /**

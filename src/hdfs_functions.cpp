@@ -1,6 +1,7 @@
 #include "hdfs_functions.hpp"
 
 #include "hdfs_filesystem.hpp"
+#include "duckdb/main/client_context_file_opener.hpp"
 
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -136,6 +137,7 @@ bool WalkFlag(ClientContext &context, const Value &override_value, const char *s
 unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
 	auto state = make_uniq<HdfsMetaGlobalState>();
+	ClientContextFileOpener opener(context);
 	switch (bind_data.op) {
 	case HdfsMetaOp::LIST: {
 		HdfsWalkOptions options;
@@ -148,14 +150,14 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 		// like DuckDB's globber, any of these characters selects glob mode,
 		// and `\*` etc. are then matched literally by the pattern itself.
 		if (bind_data.path.find_first_of("*?[{") != string::npos) {
-			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context), options);
+			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context), options, &opener);
 		} else {
-			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context), options);
+			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context), options, &opener);
 		}
 		break;
 	}
 	case HdfsMetaOp::STAT:
-		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path));
+		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path, &opener));
 		break;
 	}
 	return std::move(state);
@@ -228,10 +230,11 @@ TableFunction MakeMetaFunction(const string &name) {
 
 // hdfs_exists(path) -> BOOLEAN
 void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
+	ClientContextFileOpener opener(state.GetContext());
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto *hdfs = func_expr.function.function_info->Cast<HdfsScalarFunctionInfo>().hdfs;
 	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(),
-	                                       [&](string_t path) { return hdfs->Exists(path.GetString()); });
+	                                       [&](string_t path) { return hdfs->Exists(path.GetString(), &opener); });
 }
 
 } // namespace

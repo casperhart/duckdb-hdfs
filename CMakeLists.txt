@@ -16,7 +16,7 @@ include_directories(src/include)
 # (outside src/ so the clang-format checks don't fight generated code).
 include_directories(hdfs-bridge/include)
 
-set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp)
+set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp src/hdfs_secret.cpp)
 
 # Build the Rust FFI bridge (hdfs-bridge) via Corrosion. Corrosion integrates
 # cargo into the cmake build and, crucially for CI, honours -DRust_CARGO_TARGET
@@ -73,3 +73,28 @@ install(
   TARGETS ${EXTENSION_NAME}
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Linux 链接器包装远端桥接，验证真实文件系统逻辑，无需 HDFS 服务。
+if(BUILD_UNITTESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(hdfs_open_mode_test test/open_mode.cpp)
+    target_link_libraries(hdfs_open_mode_test hdfs_extension duckdb_static dummy_static_extension_loader)
+    foreach(symbol connect free_client create close_writer write open close_reader file_size read_range)
+        target_link_libraries(hdfs_open_mode_test "-Wl,--wrap=hdfs_bridge_${symbol}")
+    endforeach()
+    add_custom_target(hdfs_open_mode_check
+        COMMAND $<TARGET_FILE:hdfs_open_mode_test>
+        DEPENDS hdfs_open_mode_test
+        VERBATIM)
+    add_executable(hdfs_secret_config_test test/secret_config.cpp)
+    target_link_libraries(hdfs_secret_config_test duckdb_static)
+    link_extension_libraries(hdfs_secret_config_test "")
+    foreach(symbol connect connect_config free_client open close_reader file_size create close_writer
+                   get_file_info mkdirs delete rename list_stream_open glob_stream_open list_stream_next
+                   list_stream_free stat free_dir_entries)
+        target_link_libraries(hdfs_secret_config_test "-Wl,--wrap=hdfs_bridge_${symbol}")
+    endforeach()
+    add_custom_target(hdfs_secret_check
+        COMMAND $<TARGET_FILE:hdfs_secret_config_test>
+        DEPENDS hdfs_secret_config_test
+        VERBATIM)
+endif()
