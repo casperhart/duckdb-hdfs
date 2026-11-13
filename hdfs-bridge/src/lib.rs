@@ -220,10 +220,47 @@ pub unsafe extern "C" fn hdfs_bridge_connect(
     user: *const c_char,
     status: *mut Status,
 ) -> *mut BridgeClient {
-    let url = unsafe { opt_str(url) };
-    let config_dir = unsafe { opt_str(config_dir) };
-    let user = unsafe { opt_str(user) };
-    match BridgeClient::connect(url, config_dir, user) {
+    unsafe {
+        hdfs_bridge_connect_config(url, config_dir, user, ptr::null(), ptr::null(),
+                                   ptr::null(), ptr::null(), 0, status)
+    }
+}
+
+/// 显式连接入口；配置数组在调用内复制，不保留调用方指针。
+/// 非零 count 要求 keys 和 values 及其元素均非空指针。
+#[no_mangle]
+pub unsafe extern "C" fn hdfs_bridge_connect_config(
+    url: *const c_char,
+    config_dir: *const c_char,
+    user: *const c_char,
+    principal: *const c_char,
+    keytab: *const c_char,
+    keys: *const *const c_char,
+    values: *const *const c_char,
+    count: usize,
+    status: *mut Status,
+) -> *mut BridgeClient {
+    if count > 0 && (keys.is_null() || values.is_null()) {
+        unsafe { set_status(status, HDFS_ERR_INVALID_ARGUMENT, "NULL configuration array") };
+        return ptr::null_mut();
+    }
+    let mut config = Vec::new();
+    for i in 0..count {
+        let (key, value) = unsafe { (*keys.add(i), *values.add(i)) };
+        if key.is_null() || value.is_null() {
+            unsafe { set_status(status, HDFS_ERR_INVALID_ARGUMENT, "NULL configuration entry") };
+            return ptr::null_mut();
+        }
+        config.push(unsafe {
+            (CStr::from_ptr(key).to_string_lossy().into_owned(),
+             CStr::from_ptr(value).to_string_lossy().into_owned())
+        });
+    }
+    let result = unsafe {
+        BridgeClient::connect_config(opt_str(url), opt_str(config_dir), opt_str(user),
+                                     opt_str(principal), opt_str(keytab), config)
+    };
+    match result {
         Ok(client) => Box::into_raw(Box::new(client)),
         Err(e) => {
             unsafe { set_error(status, "failed to connect to HDFS", &e) };
@@ -663,5 +700,60 @@ pub unsafe extern "C" fn hdfs_bridge_rename(
             unsafe { set_error(status, format_args!("rename '{src}' -> '{dst}' failed"), &e) };
             -1
         }
+    }
+}
+
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn config_bridge_rejects_invalid_arrays_and_keytab_without_principal() {
+        let url = CString::new("hdfs://127.0.0.1:9000").unwrap();
+        let keytab = CString::new("/unused.keytab").unwrap();
+        let null_key = [ptr::null()];
+        for (keys, values, count, kt) in [
+            (ptr::null(), ptr::null(), 1, ptr::null()),
+            (null_key.as_ptr(), null_key.as_ptr(), 1, ptr::null()),
+            (ptr::null(), ptr::null(), 0, keytab.as_ptr()),
+        ] {
+            let mut status = Status { code: HDFS_OK, msg: ptr::null_mut() };
+            let client = unsafe { hdfs_bridge_connect_config(url.as_ptr(), ptr::null(), ptr::null(),
+                ptr::null(), kt, keys, values, count, &mut status) };
+            assert!(client.is_null());
+            assert_eq!(status.code, HDFS_ERR_INVALID_ARGUMENT);
+            unsafe { hdfs_bridge_free_string(status.msg) };
+        }
+    }
+
+    #[test]
+    fn explicit_configuration_overrides_xml_without_connecting() {
+        let dir = std::env::temp_dir().join(format!("hdfs-bridge-conf-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("core-site.xml"),
+            "<configuration><property><name>fs.defaultFS</name><value>invalid://host</value></property></configuration>").unwrap();
+        let dir_c = CString::new(dir.to_str().unwrap()).unwrap();
+        let key = CString::new("fs.defaultFS").unwrap();
+        let value = CString::new("hdfs://127.0.0.1:9000").unwrap();
+        let keys = [key.as_ptr()];
+        let values = [value.as_ptr()];
+        let mut status = Status { code: HDFS_OK, msg: ptr::null_mut() };
+        let client = unsafe { hdfs_bridge_connect_config(ptr::null(), dir_c.as_ptr(), ptr::null(),
+            ptr::null(), ptr::null(), keys.as_ptr(), values.as_ptr(), 1, &mut status) };
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!client.is_null(), "explicit configuration was not applied");
+        assert_eq!(status.code, HDFS_OK);
+        unsafe { hdfs_bridge_free_client(client) };
+    }
+
+    #[test]
+    fn original_bridge_keeps_environment_compatible_entry() {
+        let url = CString::new("hdfs://127.0.0.1:9000").unwrap();
+        let mut status = Status { code: HDFS_OK, msg: ptr::null_mut() };
+        let client = unsafe { hdfs_bridge_connect(url.as_ptr(), ptr::null(), ptr::null(), &mut status) };
+        assert!(!client.is_null());
+        assert_eq!(status.code, HDFS_OK);
+        unsafe { hdfs_bridge_free_client(client) };
     }
 }

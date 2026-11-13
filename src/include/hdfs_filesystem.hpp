@@ -53,8 +53,8 @@ struct HdfsEntry {
 
 struct HdfsFileHandle : public FileHandle {
 	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, std::shared_ptr<hdfs_client_t> client,
-	               hdfs_reader_t *reader, hdfs_writer_t *writer)
-	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(reader), writer(writer) {
+	               hdfs_reader_t *reader, hdfs_writer_t *writer, HdfsConnection &connection)
+	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(reader), writer(writer), connection(connection) {
 	}
 
 	~HdfsFileHandle() override {
@@ -75,6 +75,8 @@ struct HdfsFileHandle : public FileHandle {
 	std::shared_ptr<hdfs_client_t> client;
 	hdfs_reader_t *reader = nullptr;
 	hdfs_writer_t *writer = nullptr;
+	/** 打开时固定的配置连接；文件系统持有它，重试不重新解析 Secret。 */
+	HdfsConnection &connection;
 	// Cursor for the streaming Read/Write/Seek interface.
 	idx_t position = 0;
 	// Cached length for readers; bytes written so far for writers.
@@ -175,12 +177,12 @@ public:
 	// carries the hidden-entry and permission-error behavior (see
 	// HdfsWalkOptions).
 	unique_ptr<HdfsListStream> OpenListStream(const string &url, int32_t max_parallelism = 1,
-	                                          HdfsWalkOptions options = {});
+	                                          HdfsWalkOptions options = {}, optional_ptr<FileOpener> opener = nullptr);
 	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, int32_t max_parallelism = 1,
-	                                          HdfsWalkOptions options = {});
-	HdfsEntry Stat(const string &url);
+	                                          HdfsWalkOptions options = {}, optional_ptr<FileOpener> opener = nullptr);
+	HdfsEntry Stat(const string &url, optional_ptr<FileOpener> opener = nullptr);
 	// True if `url` exists (file or directory); a single stat RPC.
-	bool Exists(const string &url);
+	bool Exists(const string &url, optional_ptr<FileOpener> opener = nullptr);
 
 	bool CanHandleFile(const string &fpath) override;
 	std::string GetName() const override {
@@ -194,12 +196,10 @@ public:
 	}
 
 private:
-	// Look up (or create) the connection for the given authority
-	// (e.g. "hdfs://namenode:8020", or "" for the configured default FS).
-	// Connections are created once and reused; the returned reference is stable.
-	HdfsConnection &GetConnection(const string &authority);
+	/** 解析一次凭据并按配置取得稳定连接引用；创建对象时不发起远端请求。 */
+	HdfsConnection &GetConnection(const string &url, optional_ptr<FileOpener> opener);
 
-	// Run `op(client, &status)` against a live client for `authority`; `op`
+	// Run `op(client, &status)` against a live client for `conn`; `op`
 	// receives the shared_ptr keeping that client alive and returns true on
 	// success. An `op` handing out a resource tied to the client (a reader or
 	// writer) must copy the shared_ptr alongside it. If the first attempt fails
@@ -210,7 +210,7 @@ private:
 	// category and message). A failure to (re)connect propagates as an
 	// IOException.
 	template <class FN>
-	void Execute(const string &authority, BridgeStatus &status, FN &&op);
+	void Execute(HdfsConnection &conn, BridgeStatus &status, FN &&op);
 
 	// Guards only insertion/lookup into `connections`; entries are never erased,
 	// so the per-connection lock (inside HdfsConnection) covers (re)connection.

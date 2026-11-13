@@ -81,6 +81,21 @@ impl BridgeClient {
         config_dir: Option<String>,
         user: Option<String>,
     ) -> Result<Self, HdfsError> {
+        Self::connect_config(url, config_dir, user, None, None, Vec::new())
+    }
+
+    /// 按显式凭据和配置构造客户端；不修改进程环境。
+    pub fn connect_config(
+        url: Option<String>,
+        config_dir: Option<String>,
+        user: Option<String>,
+        principal: Option<String>,
+        keytab: Option<String>,
+        config: Vec<(String, String)>,
+    ) -> Result<Self, HdfsError> {
+        if keytab.is_some() && principal.is_none() {
+            return Err(HdfsError::InvalidArgument("keytab requires principal".into()));
+        }
         let rt = shared_runtime()?;
         // The client spawns its IO tasks on our runtime; a plain `build()`
         // would lazily create a second, hidden runtime.
@@ -94,6 +109,13 @@ impl BridgeClient {
         if let Some(user) = user {
             builder = builder.with_user(user);
         }
+        if let Some(principal) = principal {
+            builder = builder.with_kerberos_principal(principal);
+        }
+        if let Some(keytab) = keytab {
+            builder = builder.with_kerberos_keytab(keytab);
+        }
+        builder = builder.with_config(config);
         Ok(Self {
             inner: builder.build()?,
             rt,
